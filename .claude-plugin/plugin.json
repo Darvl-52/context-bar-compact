@@ -1,6 +1,6 @@
 {
   "name": "context-bar-compact",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "One-line context bar above the prompt: usage by /context category, 5h/7d limits and room before compaction; /context-bar details for a full breakdown. Compact fork of akash001uts/context-bar (MIT).",
   "types": "./types/index.d.ts",
   "author": {

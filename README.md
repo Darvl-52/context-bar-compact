@@ -4,25 +4,26 @@ A Claude Code mod: your context window, rate limits and room before compaction i
 the prompt.
 
 ```
-██████▒░░░░░░░░░░░░░ 30% 60k/200k · 5h 42% ↻2h14m · 7d 18% · 100k to compact
+██████▒░░░░░░░░░░░░░ 30% 60k/200k · compacts in 100k       5-hour 42% resets in 2h14m · weekly 18%
 ```
 
-- The bar is 20 cells, coloured by the same categories `/context` uses.
-- `5h` and `7d` are your rate limits (subscription accounts only); `↻` is the time until the 5-hour
-  window resets.
-- `to compact` is how many tokens are left before auto-compaction.
-- On a narrow terminal the bar shrinks first, then the end of the line is cut.
+- On the left, this session's window: the bar, 20 cells coloured by the same categories `/context`
+  uses, the share in use, its size, and how many tokens are left before auto-compaction.
+- On the right, your account's rate limits (subscription accounts only) and when each resets. A
+  limit reads green while there is room, yellow from 75% and red from 90%.
+- On a narrow terminal the limits shorten to `5h 42% ↻2h14m · 7d 18%`, then the bar shrinks, then
+  the end of the line is cut.
 
 ### The working zone
 
 Answers get worse well before the window is full, so the bar watches the share in use:
 
-- under 50% the figure is dim;
+- under 50% the figure is green;
 - from 50% it turns yellow;
 - from 60% it turns red, a toast says so once, and a second row offers a way out:
 
 ```
-████████████▒░░░░░░░ 62% 124k/200k · 5h 42% ↻2h14m · 7d 18% · 36k to compact
+████████████▒░░░░░░░ 62% 124k/200k · compacts in 36k      5-hour 42% resets in 2h14m · weekly 18%
 ⚠ past the working zone (50–60%)  h: handoff  c: /compact
 ```
 

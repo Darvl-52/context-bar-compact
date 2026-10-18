@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { ContextCategory, SessionUsage } from 'claude-code'
 import type { TestBody } from 'claude-code/testing'
 
-import { allocate, findHandoff, nudge, parseZone, thresholdsOf, zoneOf } from '../hooks/register'
+import { allocate, findHandoff, limitColor, nudge, parseZone, thresholdsOf, zoneOf } from '../hooks/register'
 
 const row = (name: string, tokens: number, color: string, kind: ContextCategory['kind']): ContextCategory => ({
   name,
@@ -139,10 +139,17 @@ test('the one line shows rate limits and room before compaction', async ($, on) 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
 
+  // 80 columns hold the short labels only.
   let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
-  expect(await ui.find({ type: 'Text', text: /30% 60k\/200k · 5h 42% ↻2h14m · 7d 18% · 100k to compact/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /7d 18%/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /30% 60k\/200k · compacts in 100k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^5h 42% ↻2h14m · 7d 18%$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /session/ })).toBeUndefined()
+  await ui.unmount()
+
+  // A wide terminal spells them out, apart from the window's figures.
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND, props: { ...BAND.props, bodyColumns: 140 } })
+  expect(await ui.find({ type: 'Text', text: /^5-hour 42% resets in 2h14m · weekly 18%$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /▒ 30% 60k\/200k · compacts in 100k$/ })).toBeDefined()
   await ui.unmount()
 
   // The minute ticker moves the reset countdown without a new usage read.
@@ -153,9 +160,15 @@ test('the one line shows rate limits and room before compaction', async ($, on) 
 
   // A single row is enough for everything.
   ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND, props: { ...BAND.props, maxRows: 1 } })
-  expect(await ui.find({ type: 'Text', text: /to compact/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /compacts in/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /30%/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('a rate limit reads green with room, yellow from 75%, red from 90%', () => {
+  expect(limitColor(42)).toBe('success')
+  expect(limitColor(75)).toBe('warning')
+  expect(limitColor(90)).toBe('error')
 })
 
 test('no limits or compaction off a subscription with compaction off', async ($, on) => {
@@ -169,7 +182,7 @@ test('no limits or compaction off a subscription with compaction off', async ($,
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
-  expect(await ui.find({ type: 'Text', text: /5h|to compact|session/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /5h|5-hour|compacts in|session/ })).toBeUndefined()
   await ui.unmount()
 })
 

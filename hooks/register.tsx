@@ -27,7 +27,12 @@ const GLYPH = { used: '█', buffer: '▒', free: '░' } as const
 const BAR_CELLS = 20
 const REFRESH_MS = 3000
 const TICK_MS = 60_000
-const LIMIT_LABEL: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
+const LIMIT_SHORT: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
+const LIMIT_LONG: Record<string, string> = { five_hour: '5-hour', seven_day: 'weekly', spend_limit: 'spend' }
+const LIMIT_WARN_AT = 75
+const LIMIT_ALERT_AT = 90
+// The least room kept between the window's figures and the rate limits.
+const GAP = 3
 // The working zone of the window: from `warnAt` the figure turns yellow, from `alertAt` red,
 // with a toast once and a row offering a handoff or /compact. Set with /context-bar zone and kept
 // in the plugin's store between sessions; these are the defaults.
@@ -64,7 +69,7 @@ export const parseZone = (args: string): 'open' | 'reset' | Thresholds | undefin
 export type Zone = 'ok' | 'warn' | 'over'
 export const zoneOf = (percent: number, t: Thresholds = DEFAULT_THRESHOLDS): Zone =>
   percent >= t.alertAt ? 'over' : percent >= t.warnAt ? 'warn' : 'ok'
-const ZONE_COLOR: Record<Zone, string | undefined> = { ok: undefined, warn: 'warning', over: 'error' }
+const ZONE_COLOR: Record<Zone, string> = { ok: 'success', warn: 'warning', over: 'error' }
 
 // Matt Pocock's handoff skill, when its plugin is installed: the command's name as typed.
 export const findHandoff = (commands: readonly { name: string; plugin?: string }[]) =>
@@ -86,16 +91,25 @@ export const span = (ms: number) => {
   return `${Math.floor(hours / 24)}d${hours % 24}h`
 }
 
-// After the bar: rate limits with their reset countdown, then room before compaction.
-export const infoLine = (snap: Snapshot, at: number) => {
-  const parts = snap.limits.map(l => {
-    const label = LIMIT_LABEL[l.kind] ?? l.kind
-    const reset = l.resetsAt !== undefined && l.resetsAt > at ? ` ↻${span(l.resetsAt - at)}` : ''
-    return `${label} ${l.percentUsed}%${reset}`
+// The figures beside the bar, all about this session's window: its size, then room before
+// auto-compaction.
+export const contextLine = (snap: Snapshot) =>
+  ` ${tiny(snap.total)}/${tiny(snap.max)}${snap.compactIn !== undefined ? ` · compacts in ${tiny(snap.compactIn)}` : ''}`
+
+export type LimitPart = { label: string; percent: number; reset: string }
+// The account's rate limits, drawn apart from the window at the right end. Spelled out
+// (`5-hour`, `resets in`) where the line has room, in the short form (`5h`, `↻`) where it has not.
+export const limitParts = (limits: readonly Limit[], at: number, isShort: boolean): LimitPart[] =>
+  limits.map(l => {
+    const label = (isShort ? LIMIT_SHORT : LIMIT_LONG)[l.kind] ?? l.kind
+    const left = l.resetsAt !== undefined && l.resetsAt > at ? span(l.resetsAt - at) : undefined
+    return { label, percent: l.percentUsed, reset: left === undefined ? '' : isShort ? ` ↻${left}` : ` resets in ${left}` }
   })
-  if (snap.compactIn !== undefined) parts.push(`${tiny(snap.compactIn)} to compact`)
-  return parts.join(' · ')
-}
+
+export const limitsText = (parts: readonly LimitPart[]) => parts.map(p => `${p.label} ${p.percent}%${p.reset}`).join(' · ')
+
+// A rate limit reads green while there is room, yellow as it runs short, red near the end.
+export const limitColor = (percent: number) => (percent >= LIMIT_ALERT_AT ? 'error' : percent >= LIMIT_WARN_AT ? 'warning' : 'success')
 
 // Split `width` cells across segments by largest remainder, giving every
 // non-empty used segment at least one cell so small categories stay visible.
@@ -303,19 +317,26 @@ export const register: Register = on => {
     if (!snap || snap.segments.length === 0) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const info = infoLine(snap, await read($, now))
+    const at = await read($, now)
     const thresholds = await read($, zoneAtom)
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
-    const summary = ` ${tiny(snap.total)}/${tiny(snap.max)}${info ? ` · ${info}` : ''}`
-    // A short bar, narrower still when the summary would not fit beside it.
-    const width = Math.max(8, Math.min(BAR_CELLS, e.props.bodyColumns - figure.length - summary.length))
+    const context = contextLine(snap)
+    // The widest layout that fits: the long labels beside a full bar, else the short labels and
+    // a bar narrowed to the room left; past that the line is cut at its end.
+    const roomFor = (isShort: boolean) => {
+      const right = limitsText(limitParts(snap.limits, at, isShort)).length
+      return e.props.bodyColumns - figure.length - context.length - (right > 0 ? GAP + right : 0)
+    }
+    const isShort = roomFor(false) < BAR_CELLS
+    const width = isShort ? Math.max(8, Math.min(BAR_CELLS, roomFor(true))) : BAR_CELLS
     const cells = allocate(snap.segments, snap.max, width)
+    const limits = limitParts(snap.limits, at, isShort)
     // The buttons put the command in the prompt box rather than run it: a handoff wants to be
     // told what the next session is for, and either can still be thought better of.
     const fill = (text: string) => void $.prompt.fill({ text }).catch(() => {})
 
-    const bar = (
+    const left = (
       <Text wrap="truncate">
         {snap.segments.map((s, i) =>
           cells[i]! > 0 ? (
@@ -324,11 +345,32 @@ export const register: Register = on => {
             </Text>
           ) : null,
         )}
-        <Text color={ZONE_COLOR[zone]} dimColor={zone === 'ok'} bold={zone === 'over'}>
+        <Text color={ZONE_COLOR[zone]} bold={zone === 'over'}>
           {figure}
         </Text>
-        <Text dimColor>{summary}</Text>
+        <Text dimColor>{context}</Text>
       </Text>
+    )
+    const right =
+      limits.length === 0 ? null : (
+        <Text wrap="truncate">
+          {limits.map((l, i) => (
+            <Text>
+              <Text dimColor>{`${i > 0 ? ' · ' : ''}${l.label} `}</Text>
+              <Text color={limitColor(l.percent)} bold={l.percent >= LIMIT_ALERT_AT}>
+                {l.percent}%
+              </Text>
+              <Text dimColor>{l.reset}</Text>
+            </Text>
+          ))}
+        </Text>
+      )
+    // The window on the left, the account's limits pinned to the right end.
+    const bar = (
+      <Box flexDirection="row" justifyContent="space-between" gap={GAP}>
+        {left}
+        {right}
+      </Box>
     )
     // The band is shared: what the plugins beneath draw there stays, under the bar.
     const below = await next(e)

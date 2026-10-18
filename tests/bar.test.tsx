@@ -512,11 +512,29 @@ test('a new session in the folder is offered its handoff; another folder, a stal
   expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
   await ui.unmount()
   expect(Object.keys(store.get('handoffs') as object)).toEqual(['/old'])
+})
 
-  await $.session.start({ cwd: '/old', surface: 'terminal', isInteractive: true })
-  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+test('a handoff older than a day is not offered', async ($, on) => {
+  const h = { path: PATH, cwd: '/proj', at: 10 * HOUR - 25 * HOUR, title: 'моды' }
+  const { suggestions } = await handoffSession($, on, { handoffs: { '/proj': h } })
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
   expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
   await ui.unmount()
+  expect(suggestions).toEqual([])
+})
+
+test('a reload of the mod does not offer the handoff again', async ($, on) => {
+  const h = { path: PATH, cwd: '/proj', at: 10 * HOUR, title: 'моды' }
+  const { suggestions, clock, send } = await handoffSession($, on, { handoffs: { '/proj': h } })
+  await clock.advance(1_000)
+  await send('something else')
+  // A reload runs session.start again in the same session.
+  await $.session.start({ cwd: '/proj/sub', surface: 'terminal', isInteractive: true })
+  await clock.advance(1_000)
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
+  await ui.unmount()
+  expect(suggestions).toEqual([resumeText(PATH)])
 })
 
 test('the handoff row shows with the bar off, and any other prompt puts it away', async ($, on) => {

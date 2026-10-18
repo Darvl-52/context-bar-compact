@@ -1,6 +1,6 @@
 {
   "name": "context-bar-compact",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "One line above the prompt: the context window by /context category and room before compaction on the left, 5-hour and weekly limits on the right; /context-bar details for a full breakdown. Compact fork of akash001uts/context-bar (MIT).",
   "types": "./types/index.d.ts",
   "author": {

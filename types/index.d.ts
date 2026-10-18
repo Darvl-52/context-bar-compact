@@ -33,6 +33,6 @@ export type Handoff = { path: string; cwd: string; at: number; title: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds; handoff: Handoff | null }
+    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds; handoff: Handoff | null; hasStarted: boolean }
   }
 }

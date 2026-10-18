@@ -114,6 +114,12 @@ claude plugin install context-bar-compact --marketplace Darvl-52/context-bar-com
 If you have [context-bar](https://github.com/akash001uts/claude-mods) installed, disable it: both
 register `/context-bar`.
 
+Mods are early access, and Claude Code may not load an installed plugin's hooks module: with a
+third-party provider (Bedrock, Vertex, a gateway) or with telemetry turned off, nothing shows and
+`/context-bar` is an unknown command. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in the environment
+Claude Code starts in (your shell profile), then start a new session.
+`claude --debug` says why a module was not loaded: search its log for `hooks module`.
+
 ## Credit
 
 A compact fork of [context-bar](https://github.com/akash001uts/claude-mods) by Akash Bhatnagar

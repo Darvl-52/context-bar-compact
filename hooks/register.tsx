@@ -1,19 +1,23 @@
-import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
 import type { Details, Handoff, Limit, Row, Segment, Snapshot, Thresholds } from '../types'
 
+// Session values, read and written with $.state at each call site: Claude Code 2.1.280 refuses
+// to load a module that passes `$` to the imported `read`/`update` helpers.
 // On at the start of every session; /context-bar hides it for that session only.
-const isOn = atom({ plugin: 'context-bar-compact', key: 'isOn' } as const, true)
-const snapshot = atom({ plugin: 'context-bar-compact', key: 'snapshot' } as const, null)
+const isOn = { plugin: 'context-bar-compact', key: 'isOn' } as const
+const snapshot = { plugin: 'context-bar-compact', key: 'snapshot' } as const
 // The time the band last read, bumped each minute so the reset countdowns move.
-const now = atom({ plugin: 'context-bar-compact', key: 'now' } as const, 0)
-const details = atom({ plugin: 'context-bar-compact', key: 'details' } as const, null)
-const isDetailsOpen = atom({ plugin: 'context-bar-compact', key: 'isDetailsOpen' } as const, false)
+const now = { plugin: 'context-bar-compact', key: 'now' } as const
+const details = { plugin: 'context-bar-compact', key: 'details' } as const
+const isDetailsOpen = { plugin: 'context-bar-compact', key: 'isDetailsOpen' } as const
 // The working zone in force: what /context-bar zone saved, else the defaults.
-const zoneAtom = atom({ plugin: 'context-bar-compact', key: 'zone' } as const, { warnAt: 50, alertAt: 60 })
+const zoneState = { plugin: 'context-bar-compact', key: 'zone' } as const
 // The handoff offered above the prompt, until it is taken up, dismissed or another prompt is sent.
-const offer = atom({ plugin: 'context-bar-compact', key: 'handoff' } as const, null)
+const offer = { plugin: 'context-bar-compact', key: 'handoff' } as const
+// Set at the session's first start: a reload runs session.start again, and must not offer the
+// handoff a second time.
+const hasStarted = { plugin: 'context-bar-compact', key: 'hasStarted' } as const
 
 const PANE = 'context-details'
 const ZONE_PANE = 'context-zone'
@@ -176,7 +180,7 @@ let isHandingOff = false
 async function refresh($: EngineInterface, force = false) {
   const at = await $.clock.now()
   if (isFetching || (!force && at - lastFetch < REFRESH_MS)) return
-  if (!(await read($, isOn))) return
+  if (!((await $.state.get(isOn)).value ?? true)) return
   isFetching = true
   lastFetch = at
   try {
@@ -196,9 +200,9 @@ async function refresh($: EngineInterface, force = false) {
     }
     if (b.isAutoCompactEnabled && b.autoCompactThreshold !== undefined) next.compactIn = Math.max(0, b.autoCompactThreshold - b.totalTokens)
     // Time first, so the new snapshot never draws against a stale clock.
-    await update($, now, () => at)
-    await update($, snapshot, () => next)
-    const zone = zoneOf(next.percent, await read($, zoneAtom))
+    await $.state.set(now, at)
+    await $.state.set(snapshot, next)
+    const zone = zoneOf(next.percent, (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS)
     if (zone === 'over' && !hasAlerted) {
       hasAlerted = true
       $.ui.toast(`Context ${next.percent}%: past the working zone. ${handoff ? 'Handoff or /compact' : '/compact'} from the row above the prompt.`)
@@ -250,21 +254,21 @@ async function refreshDetails($: EngineInterface) {
       }
     if (b.slashCommands)
       next.commands = { total: b.slashCommands.totalCommands, included: b.slashCommands.includedCommands, tokens: b.slashCommands.tokens }
-    await update($, details, () => next)
+    await $.state.set(details, next)
   } finally {
     isFetchingDetails = false
   }
 }
 
 async function openDetails($: EngineInterface) {
-  await update($, isDetailsOpen, () => true)
+  await $.state.set(isDetailsOpen, true)
   await $.ui.open({ id: PANE, title: 'Context details' })
   await refreshDetails($).catch(() => {})
 }
 
 async function setZone($: EngineInterface, t: Thresholds | 'reset') {
   const next = t === 'reset' ? DEFAULT_THRESHOLDS : t
-  await update($, zoneAtom, () => next)
+  await $.state.set(zoneState, next)
   if (t === 'reset') await $.store.delete(ZONE_KEY)
   else await $.store.set(ZONE_KEY, next)
   // The toast is armed again for the new zone.
@@ -280,7 +284,7 @@ async function offerHandoff($: EngineInterface, cwd: string) {
   const saved = (await savedHandoffs($))[cwd]
   const at = await $.clock.now()
   const isLive = saved !== undefined && at - saved.at < HANDOFF_MAX_AGE_MS && (await $.fs.exists(saved.path).catch(() => false))
-  await update($, offer, () => (isLive ? saved : null))
+  await $.state.set(offer, isLive ? saved : null)
   if (isLive) void $.clock.sleep(300).then(() => $.prompt.suggest({ text: resumeText(saved.path) })).catch(() => {})
 }
 
@@ -290,7 +294,7 @@ async function forgetHandoff($: EngineInterface, spent: Handoff) {
     delete all[spent.cwd]
     await $.store.set(HANDOFFS_KEY, all)
   }
-  await update($, offer, () => null)
+  await $.state.set(offer, null)
 }
 
 export const register: Register = on => {
@@ -306,14 +310,16 @@ export const register: Register = on => {
     tick?.cancel()
     if (e.isInteractive)
       tick = $.clock.every(TICK_MS, () => {
-        void $.clock.now().then(at => update($, now, () => at))
+        void $.clock.now().then(at => $.state.set(now, at))
       })
     handoff = findHandoff(await $.command.list().catch(() => []))
     const saved = (await $.store.get(ZONE_KEY).catch(() => undefined)) as Partial<Thresholds> | undefined
-    await update($, zoneAtom, () => (saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS))
+    await $.state.set(zoneState, saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS)
     // Draw the bar as soon as the session opens; never let a failed read block startup.
     await refresh($, true).catch(() => {})
-    if (e.isInteractive) await offerHandoff($, e.cwd).catch(() => {})
+    const isReload = (await $.state.get(hasStarted)).value ?? false
+    await $.state.set(hasStarted, true)
+    if (e.isInteractive && !isReload) await offerHandoff($, await $.session.root()).catch(() => {})
     return next(e)
   })
 
@@ -326,11 +332,11 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command && /(^|:)handoff$/.test(e.command.name)) isHandingOff = true
-    const waiting = await read($, offer)
+    const waiting = (await $.state.get(offer)).value ?? null
     // Taken up, it is spent; any other prompt only puts it away for this conversation.
     if (waiting && !e.isMeta) {
       if (e.text.includes(waiting.path)) await forgetHandoff($, waiting)
-      else await update($, offer, () => null)
+      else await $.state.set(offer, null)
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -361,17 +367,17 @@ export const register: Register = on => {
         return { text: 'Working zone opened.' }
       }
       await setZone($, asked)
-      const t = await read($, zoneAtom)
+      const t = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
       return { text: `Working zone: yellow from ${t.warnAt}%, red from ${t.alertAt}%.` }
     }
-    const nextOn = !(await read($, isOn))
-    await update($, isOn, () => nextOn)
+    const nextOn = !((await $.state.get(isOn)).value ?? true)
+    await $.state.set(isOn, nextOn)
     if (nextOn) await refresh($, true)
     return { text: nextOn ? 'Context bar on.' : 'Context bar off.' }
   })
 
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) await update($, isDetailsOpen, () => false)
+    if (e.id === PANE) await $.state.set(isDetailsOpen, false)
     return next(e)
   })
 
@@ -383,19 +389,19 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     isHandingOff = false
     void refresh($, true)
-    if (await read($, isDetailsOpen)) void refreshDetails($).catch(() => {})
+    if ((await $.state.get(isDetailsOpen)).value ?? false) void refreshDetails($).catch(() => {})
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const waiting = await read($, offer)
-    const snap = (await read($, isOn)) ? await read($, snapshot) : null
+    const waiting = (await $.state.get(offer)).value ?? null
+    const snap = ((await $.state.get(isOn)).value ?? true) ? ((await $.state.get(snapshot)).value ?? null) : null
     const hasBar = snap !== null && snap.segments.length > 0
     if (!hasBar && !waiting) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const at = await read($, now)
+    const at = (await $.state.get(now)).value ?? 0
     // The buttons put the command in the prompt box rather than run it: a handoff wants to be
     // told what the next session is for, and either can still be thought better of.
     const fill = (text: string) => void $.prompt.fill({ text }).catch(() => {})
@@ -420,7 +426,7 @@ export const register: Register = on => {
         </Box>
       )
 
-    const thresholds = await read($, zoneAtom)
+    const thresholds = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
     const context = contextLine(snap)
@@ -498,8 +504,8 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: ZONE_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const t = await read($, zoneAtom)
-    const snap = await read($, snapshot)
+    const t = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
+    const snap = (await $.state.get(snapshot)).value ?? null
     const step = (which: keyof Thresholds, label: string, color: string) => (
       <Box flexDirection="row" gap={1}>
         <Text color={color}>{label}</Text>
@@ -546,7 +552,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const d = await read($, details)
+    const d = (await $.state.get(details)).value ?? null
     const refreshButton = <Button key="refresh" label="Refresh" hotkey="r" dimColor onPress={() => refreshDetails($).catch(() => {})} />
     if (!d)
       return (

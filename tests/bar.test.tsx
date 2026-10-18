@@ -329,3 +329,20 @@ test('set to 40–70%, 65% warns but offers nothing yet, and 72% does', { option
   expect(await ui.find({ type: 'Text', text: /past the working zone \(40–70%\)/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('the band is shared: what is drawn beneath stays under the bar', async ($, on) => {
+  mock.clock(on)
+  on('session.usage', () => ({ value: at(30) }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.list', () => ({ value: [] }))
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /30%/ })).toBeDefined()
+  expect(await ui.find({ key: 'engine' })).toBeDefined()
+  await ui.unmount()
+})

@@ -279,7 +279,15 @@ export const register: Register = (on, options) => {
         <Text dimColor>{summary}</Text>
       </Text>
     )
-    if (zone !== 'over' || e.props.maxRows < 2) return bar
+    // The band is shared: what the plugins beneath draw there stays, under the bar.
+    const below = await next(e)
+    if (zone !== 'over' || e.props.maxRows < 2)
+      return (
+        <Box flexDirection="column">
+          {bar}
+          {below}
+        </Box>
+      )
     return (
       <Box flexDirection="column">
         {bar}
@@ -290,6 +298,7 @@ export const register: Register = (on, options) => {
           {handoff ? <Button key="handoff" label="handoff" hotkey="h" plain onPress={() => fill(`/${handoff} `)} /> : null}
           <Button key="compact" label="/compact" hotkey="c" plain onPress={() => fill('/compact ')} />
         </Box>
+        {below}
       </Box>
     )
   })

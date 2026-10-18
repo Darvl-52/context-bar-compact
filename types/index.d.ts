@@ -25,8 +25,11 @@ export type Details = {
   api: { uncached: number; cacheRead: number; cacheWrite: number; output: number } | null
 }
 
+// The working zone: from `warnAt` % of the window the figure turns yellow, from `alertAt` red.
+export type Thresholds = { warnAt: number; alertAt: number }
+
 declare module 'claude-code' {
   interface PluginState {
-    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean }
+    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds }
   }
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, SessionRateLimit } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { Details, Limit, Row, Segment, Snapshot } from '../types'
+import type { Details, Limit, Row, Segment, Snapshot, Thresholds } from '../types'
 
 // On at the start of every session; /context-bar hides it for that session only.
 const isOn = atom({ plugin: 'context-bar-compact', key: 'isOn' } as const, true)
@@ -10,27 +10,55 @@ const snapshot = atom({ plugin: 'context-bar-compact', key: 'snapshot' } as cons
 const now = atom({ plugin: 'context-bar-compact', key: 'now' } as const, 0)
 const details = atom({ plugin: 'context-bar-compact', key: 'details' } as const, null)
 const isDetailsOpen = atom({ plugin: 'context-bar-compact', key: 'isDetailsOpen' } as const, false)
+// The working zone in force: what /context-bar zone saved, else the defaults.
+const zoneAtom = atom({ plugin: 'context-bar-compact', key: 'zone' } as const, { warnAt: 50, alertAt: 60 })
 
 const PANE = 'context-details'
+const ZONE_PANE = 'context-zone'
+const ZONE_KEY = 'zone'
+const ZONE_STEP = 5
+export const PRESETS: readonly Thresholds[] = [
+  { warnAt: 40, alertAt: 50 },
+  { warnAt: 50, alertAt: 60 },
+  { warnAt: 60, alertAt: 70 },
+  { warnAt: 70, alertAt: 80 },
+]
 const GLYPH = { used: '█', buffer: '▒', free: '░' } as const
 const BAR_CELLS = 20
 const REFRESH_MS = 3000
 const TICK_MS = 60_000
 const LIMIT_LABEL: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
 // The working zone of the window: from `warnAt` the figure turns yellow, from `alertAt` red,
-// with a toast once and a row offering a handoff or /compact. Both are the plugin's options
-// (warn_at, alert_at in /plugin configure); these are the defaults.
-export type Thresholds = { warnAt: number; alertAt: number }
+// with a toast once and a row offering a handoff or /compact. Set with /context-bar zone and kept
+// in the plugin's store between sessions; these are the defaults.
 export const DEFAULT_THRESHOLDS: Thresholds = { warnAt: 50, alertAt: 60 }
 
 // A value that is no number, or out of 1–100, falls back to its default; a pair given the wrong
 // way round is swapped rather than refused, the intent being plain.
-export const thresholdsOf = (options: PluginOptions): Thresholds => {
+export const thresholdsOf = (warn: unknown, alert: unknown): Thresholds => {
   const pick = (value: unknown, fallback: number) =>
-    typeof value === 'number' && Number.isFinite(value) && value >= 1 && value <= 100 ? value : fallback
-  const warnAt = pick(options.warn_at, DEFAULT_THRESHOLDS.warnAt)
-  const alertAt = pick(options.alert_at, DEFAULT_THRESHOLDS.alertAt)
+    typeof value === 'number' && Number.isFinite(value) && value >= 1 && value <= 100 ? Math.round(value) : fallback
+  const warnAt = pick(warn, DEFAULT_THRESHOLDS.warnAt)
+  const alertAt = pick(alert, DEFAULT_THRESHOLDS.alertAt)
   return alertAt >= warnAt ? { warnAt, alertAt } : { warnAt: alertAt, alertAt: warnAt }
+}
+
+// One step of a −/+ button: the other threshold moves along where it would be crossed, so the
+// pair stays in order without a press being refused.
+export const nudge = (t: Thresholds, which: keyof Thresholds, delta: number): Thresholds => {
+  const value = Math.min(100, Math.max(1, t[which] + delta))
+  if (which === 'warnAt') return { warnAt: value, alertAt: Math.max(t.alertAt, value) }
+  return { warnAt: Math.min(t.warnAt, value), alertAt: value }
+}
+
+// `/context-bar zone`, `zone 40 70`, `zone reset`: what the arguments after `zone` ask for.
+export const parseZone = (args: string): 'open' | 'reset' | Thresholds | undefined => {
+  const words = args.trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return 'open'
+  if (words.length === 1 && /^(reset|default)$/i.test(words[0]!)) return 'reset'
+  const nums = words.map(w => Number(w.replace(/%$/, '')))
+  if (nums.length === 2 && nums.every(n => Number.isFinite(n) && n >= 1 && n <= 100)) return thresholdsOf(nums[0], nums[1])
+  return undefined
 }
 
 export type Zone = 'ok' | 'warn' | 'over'
@@ -106,7 +134,6 @@ let isFetching = false
 let isFetchingDetails = false
 let tick: { cancel: () => void } | undefined
 let handoff: string | undefined
-let thresholds = DEFAULT_THRESHOLDS
 // Raised once past the zone; lowered when the window drops back under its start, after a compact.
 let hasAlerted = false
 
@@ -135,7 +162,7 @@ async function refresh($: EngineInterface, force = false) {
     // Time first, so the new snapshot never draws against a stale clock.
     await update($, now, () => at)
     await update($, snapshot, () => next)
-    const zone = zoneOf(next.percent, thresholds)
+    const zone = zoneOf(next.percent, await read($, zoneAtom))
     if (zone === 'over' && !hasAlerted) {
       hasAlerted = true
       $.ui.toast(`Context ${next.percent}%: past the working zone. ${handoff ? 'Handoff or /compact' : '/compact'} from the row above the prompt.`)
@@ -199,13 +226,22 @@ async function openDetails($: EngineInterface) {
   await refreshDetails($).catch(() => {})
 }
 
-export const register: Register = (on, options) => {
-  thresholds = thresholdsOf(options)
+async function setZone($: EngineInterface, t: Thresholds | 'reset') {
+  const next = t === 'reset' ? DEFAULT_THRESHOLDS : t
+  await update($, zoneAtom, () => next)
+  if (t === 'reset') await $.store.delete(ZONE_KEY)
+  else await $.store.set(ZONE_KEY, next)
+  // The toast is armed again for the new zone.
+  hasAlerted = false
+}
+
+export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'context-bar',
-      description: 'Toggle the context window bar above the prompt; /context-bar details opens a token breakdown',
+      description: 'Toggle the context bar; details: token breakdown; zone: set where it turns yellow and red',
+      argumentHint: '[details | zone [<yellow%> <red%> | reset]]',
     })
     // Only a session that draws the band needs the minute ticker; a reload drops
     // the old module's timers, and the cancel covers session.start firing twice in one load.
@@ -215,15 +251,29 @@ export const register: Register = (on, options) => {
         void $.clock.now().then(at => update($, now, () => at))
       })
     handoff = findHandoff(await $.command.list().catch(() => []))
+    const saved = (await $.store.get(ZONE_KEY).catch(() => undefined)) as Partial<Thresholds> | undefined
+    await update($, zoneAtom, () => (saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS))
     // Draw the bar as soon as the session opens; never let a failed read block startup.
     await refresh($, true).catch(() => {})
     return next(e)
   })
 
   on('command.run', { command: 'context-bar' }, async ($, e) => {
-    if (e.args.trim().toLowerCase() === 'details') {
+    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    if (verb.toLowerCase() === 'details') {
       await openDetails($)
       return { text: 'Context details opened.' }
+    }
+    if (verb.toLowerCase() === 'zone') {
+      const asked = parseZone(rest.join(' '))
+      if (asked === undefined) return { text: 'Usage: /context-bar zone, /context-bar zone 50 60, /context-bar zone reset' }
+      if (asked === 'open') {
+        await $.ui.open({ id: ZONE_PANE, title: 'Working zone', focus: true, closeOnEscape: true })
+        return { text: 'Working zone opened.' }
+      }
+      await setZone($, asked)
+      const t = await read($, zoneAtom)
+      return { text: `Working zone: yellow from ${t.warnAt}%, red from ${t.alertAt}%.` }
     }
     const nextOn = !(await read($, isOn))
     await update($, isOn, () => nextOn)
@@ -254,6 +304,7 @@ export const register: Register = (on, options) => {
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const info = infoLine(snap, await read($, now))
+    const thresholds = await read($, zoneAtom)
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
     const summary = ` ${tiny(snap.total)}/${tiny(snap.max)}${info ? ` · ${info}` : ''}`
@@ -299,6 +350,54 @@ export const register: Register = (on, options) => {
           <Button key="compact" label="/compact" hotkey="c" plain onPress={() => fill('/compact ')} />
         </Box>
         {below}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: ZONE_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const t = await read($, zoneAtom)
+    const snap = await read($, snapshot)
+    const step = (which: keyof Thresholds, label: string, color: string) => (
+      <Box flexDirection="row" gap={1}>
+        <Text color={color}>{label}</Text>
+        <Button key={`${which}-down`} label="−" onPress={() => void setZone($, nudge(t, which, -ZONE_STEP))} />
+        <Text bold>{String(t[which]).padStart(3)}%</Text>
+        <Button key={`${which}-up`} label="+" onPress={() => void setZone($, nudge(t, which, ZONE_STEP))} />
+      </Box>
+    )
+    const zone = snap ? zoneOf(snap.percent, t) : undefined
+    return (
+      <Box flexDirection="column">
+        {step('warnAt', 'Yellow from', 'warning')}
+        {step('alertAt', 'Red from   ', 'error')}
+        <Box flexDirection="row" gap={1} marginTop={1}>
+          <Text dimColor>Presets</Text>
+          {PRESETS.map((p, i) => (
+            <Button
+              key={`preset-${i + 1}`}
+              label={`${p.warnAt}–${p.alertAt}`}
+              hotkey={String(i + 1)}
+              variant={p.warnAt === t.warnAt && p.alertAt === t.alertAt ? 'primary' : 'secondary'}
+              onPress={() => void setZone($, p)}
+            />
+          ))}
+        </Box>
+        {snap && zone ? (
+          <Text>
+            <Text dimColor>Now </Text>
+            <Text color={ZONE_COLOR[zone]} bold>
+              {snap.percent}%
+            </Text>
+            <Text dimColor>
+              {zone === 'ok' ? ': under the zone' : zone === 'warn' ? ': yellow' : ': red, the warning row and a toast'}
+            </Text>
+          </Text>
+        ) : null}
+        <Box flexDirection="row" gap={1} marginTop={1}>
+          <Button key="reset" label={`Reset to ${DEFAULT_THRESHOLDS.warnAt}–${DEFAULT_THRESHOLDS.alertAt}`} hotkey="r" dimColor onPress={() => void setZone($, 'reset')} />
+          <Text dimColor>Saved for every session · Esc closes</Text>
+        </Box>
       </Box>
     )
   })

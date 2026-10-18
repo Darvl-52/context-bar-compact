@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { ContextCategory, SessionUsage } from 'claude-code'
 import type { TestBody } from 'claude-code/testing'
 
-import { allocate, findHandoff, thresholdsOf, zoneOf } from '../hooks/register'
+import { allocate, findHandoff, nudge, parseZone, thresholdsOf, zoneOf } from '../hooks/register'
 
 const row = (name: string, tokens: number, color: string, kind: ContextCategory['kind']): ContextCategory => ({
   name,
@@ -234,11 +234,17 @@ test('the handoff command is found by name, Matt Pocock\'s first', () => {
   expect(findHandoff([{ name: 'handoffs' }, { name: 'compact' }])).toBeUndefined()
 })
 
-const zoneSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], commands: { name: string; plugin?: string }[]) => {
+const zoneSession = async (
+  $: Parameters<TestBody>[0],
+  on: Parameters<TestBody>[1],
+  commands: { name: string; plugin?: string }[],
+  stored: Record<string, unknown> = {},
+) => {
   let usage = at(62)
   const toasts: string[] = []
   const fills: string[] = []
   const clock = mock.clock(on)
+  mock.store(on, stored)
   on('session.usage', () => ({ value: usage }))
   on('ui.render', ($, e) => {
     const { Box } = $.ui.resolve(e)
@@ -310,16 +316,33 @@ test('under 60% there is no warning row', async ($, on) => {
   await ui.unmount()
 })
 
-test('the thresholds come from the options, with defaults and the pair kept in order', () => {
-  expect(thresholdsOf({})).toEqual({ warnAt: 50, alertAt: 60 })
-  expect(thresholdsOf({ warn_at: 40, alert_at: 70 })).toEqual({ warnAt: 40, alertAt: 70 })
-  expect(thresholdsOf({ warn_at: 80, alert_at: 70 })).toEqual({ warnAt: 70, alertAt: 80 })
-  expect(thresholdsOf({ warn_at: 0, alert_at: 'x' })).toEqual({ warnAt: 50, alertAt: 60 })
+test('a zone is read in order, nudged without crossing, and parsed from the command', () => {
+  expect(thresholdsOf(undefined, undefined)).toEqual({ warnAt: 50, alertAt: 60 })
+  expect(thresholdsOf(40, 70)).toEqual({ warnAt: 40, alertAt: 70 })
+  expect(thresholdsOf(80, 70)).toEqual({ warnAt: 70, alertAt: 80 })
+  expect(thresholdsOf(0, 'x')).toEqual({ warnAt: 50, alertAt: 60 })
   expect(zoneOf(65, { warnAt: 40, alertAt: 70 })).toBe('warn')
+
+  expect(nudge({ warnAt: 50, alertAt: 60 }, 'warnAt', 5)).toEqual({ warnAt: 55, alertAt: 60 })
+  expect(nudge({ warnAt: 55, alertAt: 60 }, 'warnAt', 10)).toEqual({ warnAt: 65, alertAt: 65 })
+  expect(nudge({ warnAt: 50, alertAt: 60 }, 'alertAt', -15)).toEqual({ warnAt: 45, alertAt: 45 })
+  expect(nudge({ warnAt: 98, alertAt: 98 }, 'alertAt', 5)).toEqual({ warnAt: 98, alertAt: 100 })
+
+  expect(parseZone('')).toBe('open')
+  expect(parseZone('reset')).toBe('reset')
+  expect(parseZone('40 70')).toEqual({ warnAt: 40, alertAt: 70 })
+  expect(parseZone('40% 70%')).toEqual({ warnAt: 40, alertAt: 70 })
+  expect(parseZone('70 40')).toEqual({ warnAt: 40, alertAt: 70 })
+  expect(parseZone('40')).toBeUndefined()
+  expect(parseZone('0 200')).toBeUndefined()
 })
 
-test('set to 40–70%, 65% warns but offers nothing yet, and 72% does', { options: { warn_at: 40, alert_at: 70 } }, async ($, on) => {
+const runZone = ($: Parameters<TestBody>[0], args: string) =>
+  $.command.run({ command: 'context-bar', args: `zone ${args}`.trim(), origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+test('/context-bar zone 40 70: 65% warns but offers nothing yet, and 72% does', async ($, on) => {
   const { turn } = await zoneSession($, on, [])
+  expect((await runZone($, '40 70')).text).toBe('Working zone: yellow from 40%, red from 70%.')
   await turn(at(65))
   let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
   expect(await ui.find({ type: 'Text', text: /working zone/ })).toBeUndefined()
@@ -328,6 +351,39 @@ test('set to 40–70%, 65% warns but offers nothing yet, and 72% does', { option
   ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
   expect(await ui.find({ type: 'Text', text: /past the working zone \(40–70%\)/ })).toBeDefined()
   await ui.unmount()
+  expect((await runZone($, 'nonsense')).text).toMatch(/^Usage:/)
+})
+
+test('a zone saved in an earlier session is the one in force', async ($, on) => {
+  await zoneSession($, on, [], { zone: { warnAt: 70, alertAt: 80 } })
+  // 62% is under a 70–80 zone: no warning row.
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /working zone/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the zone pane: presets, −/+ and reset, each shown at once', async ($, on) => {
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  await zoneSession($, on, [])
+  expect((await runZone($, '')).text).toBe('Working zone opened.')
+  const pane = await $.ui.mount({
+    plugin: 'context-bar-compact',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'context-zone',
+    props: { title: 'Working zone', isFocused: true, bodyColumns: 80, placement: 'inline', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  })
+  expect(await pane.find({ type: 'Text', text: /62%: red/ })).toBeDefined()
+
+  await pane.press({ key: 'preset-3' })
+  expect(await pane.find({ type: 'Text', text: /62%: yellow/ })).toBeDefined()
+  await pane.press({ key: 'warnAt-up' })
+  expect(await pane.find({ type: 'Text', text: /65%/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /62%: under the zone/ })).toBeDefined()
+
+  await pane.press({ key: 'reset' })
+  expect(await pane.find({ type: 'Text', text: /62%: red/ })).toBeDefined()
+  await pane.unmount()
 })
 
 test('the band is shared: what is drawn beneath stays under the bar', async ($, on) => {

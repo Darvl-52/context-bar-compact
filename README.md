@@ -33,22 +33,20 @@ it writes the conversation to a file in your temp directory that a fresh session
 up. Neither runs until you press Enter. The toast comes back only after the window has dropped
 under 50% again, say after a compact.
 
-Both thresholds are settings: `/plugin configure context-bar-compact` sets `warn_at` (yellow,
-default 50) and `alert_at` (red, the toast and the row; default 60), each a percentage of the
-window. A pair given the wrong way round is swapped; a value outside 1–100 falls back to its
-default. From a shell:
-
-```sh
-echo '{"warn_at": 40, "alert_at": 70}' | claude plugin configure context-bar-compact --values-stdin
-```
+Set the zone with `/context-bar zone`: a pane with − and + for each threshold (5% a step),
+presets on `1`–`4` (40–50, 50–60, 60–70, 70–80), `r` to go back to 50–60, and your current share
+shown in the colour it would take. Every change shows on the bar at once and is kept for every
+session. Without the pane, `/context-bar zone 40 70` sets yellow from 40% and red from 70%.
 
 ## Commands
 
-| Command                                 | What it does                                                                                                                                                                                                        |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/context-bar`                          | Hide or show the bar for this session.                                                                                                                                                                              |
-| `/context-bar details`                  | Open a pane with the full breakdown: each category, memory files, MCP servers and how many of their tools are loaded, the largest skills, custom agents and the cache split of the last API call. `r` refreshes it. |
-| `/plugin configure context-bar-compact` | Set the working zone: `warn_at` and `alert_at`.                                                                                                                                                                     |
+| Command                   | What it does                                                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/context-bar`            | Hide or show the bar for this session.                                                                                                                                                                              |
+| `/context-bar details`    | Open a pane with the full breakdown: each category, memory files, MCP servers and how many of their tools are loaded, the largest skills, custom agents and the cache split of the last API call. `r` refreshes it. |
+| `/context-bar zone`       | Open the working-zone pane: −/+ for yellow and red, presets `1`–`4`, `r` resets.                                                                                                                                    |
+| `/context-bar zone 40 70` | Yellow from 40%, red from 70%, without the pane.                                                                                                                                                                    |
+| `/context-bar zone reset` | Back to 50–60.                                                                                                                                                                                                      |
 
 Keys on the warning row, once the band has the focus (a click, or ctrl+x tab):
 

@@ -1,18 +1,36 @@
 # context-bar-compact
 
-A Claude Code mod: your context window, rate limits and room before compaction in one line above
-the prompt.
+A Claude Code mod: one line above the prompt, with how full this session's context window is on
+the left and your account's rate limits on the right.
 
 ```
-██████▒░░░░░░░░░░░░░ 30% 60k/200k · compacts in 100k       5-hour 42% resets in 2h14m · weekly 18%
+██████░░░░░░░░░░░▒▒▒ 30% 60k/200k · compacts in 100k             5-hour 42% resets in 2h14m · weekly 18%
 ```
 
-- On the left, this session's window: the bar, 20 cells coloured by the same categories `/context`
-  uses, the share in use, its size, and how many tokens are left before auto-compaction.
-- On the right, your account's rate limits (subscription accounts only) and when each resets. A
-  limit reads green while there is room, yellow from 75% and red from 90%.
-- On a narrow terminal the limits shorten to `5h 42% ↻2h14m · 7d 18%`, then the bar shrinks, then
-  the end of the line is cut.
+**On the left, this session's window**
+
+- The bar, 20 cells: `█` what is in the window, in the colours `/context` gives its categories
+  (system prompt, tools, memory files, messages…), `░` the free space, `▒` the buffer kept for
+  auto-compaction.
+- `30%` the share of the window in use, coloured by the working zone (below): green, yellow or red.
+- `60k/200k` tokens in the window out of its size.
+- `compacts in 100k` how many tokens are left before Claude Code compacts the conversation; absent
+  when auto-compaction is off.
+
+**On the right, your account's rate limits** (subscription accounts only)
+
+- `5-hour 42%` and `weekly 18%` how much of each limit is used: green while there is room, yellow
+  from 75%, red from 90%.
+- `resets in 2h14m` when that limit starts over, counted down each minute.
+
+On a narrow terminal the limits shorten first, then the bar shrinks, then the end of the line is
+cut:
+
+```
+██████░░░░░░░░░░░▒▒▒ 30% 60k/200k · compacts in 100k      5h 42% ↻2h14m · 7d 18%
+```
+
+Other mods that draw rows above the prompt keep them, under this line.
 
 ### The working zone
 
@@ -23,7 +41,7 @@ Answers get worse well before the window is full, so the bar watches the share i
 - from 60% it turns red, a toast says so once, and a second row offers a way out:
 
 ```
-████████████▒░░░░░░░ 62% 124k/200k · compacts in 36k      5-hour 42% resets in 2h14m · weekly 18%
+█████████████░░░▒▒▒▒ 62% 124k/200k · compacts in 36k             5-hour 42% resets in 2h14m · weekly 18%
 ⚠ past the working zone (50–60%)  h: handoff  c: /compact
 ```
 

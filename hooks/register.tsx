@@ -1,9 +1,8 @@
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { Details, Handoff, Limit, Row, Segment, Snapshot, Thresholds } from '../types'
+import type { Details, Handoff, Lang, Limit, Pace, Row, Segment, Snapshot, Thresholds } from '../types'
 
-// Session values, read and written with $.state at each call site: Claude Code 2.1.280 refuses
-// to load a module that passes `$` to the imported `read`/`update` helpers.
+// Session values, read and written with $.state, which Claude Code has from 2.1.281.
 // On at the start of every session; /context-bar hides it for that session only.
 const isOn = { plugin: 'context-bar-compact', key: 'isOn' } as const
 const snapshot = { plugin: 'context-bar-compact', key: 'snapshot' } as const
@@ -18,10 +17,17 @@ const offer = { plugin: 'context-bar-compact', key: 'handoff' } as const
 // Set at the session's first start: a reload runs session.start again, and must not offer the
 // handoff a second time.
 const hasStarted = { plugin: 'context-bar-compact', key: 'hasStarted' } as const
+// How the window grew over the last turns, for the turns left before compaction.
+const paceState = { plugin: 'context-bar-compact', key: 'pace' } as const
+// When the main loop last had a reply: the prompt cache expires counted from it.
+const repliedAt = { plugin: 'context-bar-compact', key: 'repliedAt' } as const
+// The language in force: what /context-bar lang saved, else English.
+const langState = { plugin: 'context-bar-compact', key: 'lang' } as const
 
 const PANE = 'context-details'
 const ZONE_PANE = 'context-zone'
 const ZONE_KEY = 'zone'
+const LANG_KEY = 'lang'
 const ZONE_STEP = 5
 // The latest handoff per folder, kept in the store so a new process finds it too.
 const HANDOFFS_KEY = 'handoffs'
@@ -37,12 +43,19 @@ const GLYPH = { used: '█', buffer: '▒', free: '░' } as const
 const BAR_CELLS = 20
 const REFRESH_MS = 3000
 const TICK_MS = 60_000
-const LIMIT_SHORT: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
-const LIMIT_LONG: Record<string, string> = { five_hour: '5-hour', seven_day: 'weekly', spend_limit: 'spend' }
 const LIMIT_WARN_AT = 75
 const LIMIT_ALERT_AT = 90
 // The least room kept between the window's figures and the rate limits.
 const GAP = 3
+// The turns averaged for the pace, and the fewest counted before turns left are shown.
+const PACE_TURNS = 5
+const PACE_MIN_TURNS = 2
+// Claude Code keeps the prompt cache an hour on a subscription and five minutes otherwise. A mod
+// cannot read the setting, so a session with rate limits, a subscription's, is taken for the hour.
+const CACHE_TTL_SUBSCRIPTION_MS = 3_600_000
+const CACHE_TTL_MS = 5 * 60_000
+// The categories named on the row under a yellow or red bar.
+const LARGEST = 3
 // The working zone of the window: from `warnAt` the figure turns yellow, from `alertAt` red,
 // with a toast once and a row offering a handoff or /compact. Set with /context-bar zone and kept
 // in the plugin's store between sessions; these are the defaults.
@@ -81,6 +94,134 @@ export const zoneOf = (percent: number, t: Thresholds = DEFAULT_THRESHOLDS): Zon
   percent >= t.alertAt ? 'over' : percent >= t.warnAt ? 'warn' : 'ok'
 const ZONE_COLOR: Record<Zone, string> = { ok: 'success', warn: 'warning', over: 'error' }
 
+// Russian plural: 1 ход, 2 хода, 5 ходов.
+const plural = (n: number, one: string, few: string, many: string) => {
+  const ten = n % 10
+  const hundred = n % 100
+  return ten === 1 && hundred !== 11 ? one : ten >= 2 && ten <= 4 && (hundred < 12 || hundred > 14) ? few : many
+}
+
+// Every word the mod shows. English is the default; `/context-bar lang ru` switches to Russian for
+// every session. Claude Code names the window's categories in English; Russian translates the
+// ones it knows and keeps the rest.
+const EN = {
+  units: { m: 'm', h: 'h', d: 'd' },
+  compactsIn: 'compacts in',
+  turns: (n: number) => (n < 1 ? '<1 turn' : `~${n} turn${n === 1 ? '' : 's'}`),
+  limitLong: { five_hour: '5-hour', seven_day: 'weekly', spend_limit: 'spend' } as Record<string, string>,
+  limitShort: { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' } as Record<string, string>,
+  resetsIn: 'resets in',
+  category: (name: string) => name,
+  handoffAt: (ago?: string) => (ago === undefined ? 'just now' : `${ago} ago`),
+  resume: 'resume',
+  dismiss: 'dismiss',
+  pastZone: (t: Thresholds) => `⚠ past the working zone (${t.warnAt}–${t.alertAt}%)`,
+  largest: 'largest',
+  cold: (idle: string, tokens: string) => `◌ cache cold after ${idle} idle: the next reply re-sends ${tokens} uncached`,
+  toast: (percent: number, hasHandoff: boolean) =>
+    `Context ${percent}%: past the working zone. ${hasHandoff ? 'Handoff or /compact' : '/compact'} from the row above the prompt.`,
+  resumeText: (path: string) => `Read ${path} and pick up from there.`,
+  description: 'Toggle the context bar; details: token breakdown; zone: set where it turns yellow and red; lang: en or ru',
+  barOn: 'Context bar on.',
+  barOff: 'Context bar off.',
+  detailsOpened: 'Context details opened.',
+  detailsTitle: 'Context details',
+  zoneUsage: 'Usage: /context-bar zone, /context-bar zone 50 60, /context-bar zone reset',
+  zoneOpened: 'Working zone opened.',
+  zoneTitle: 'Working zone',
+  zoneSet: (t: Thresholds) => `Working zone: yellow from ${t.warnAt}%, red from ${t.alertAt}%.`,
+  langUsage: 'Usage: /context-bar lang en, /context-bar lang ru',
+  langSet: 'Language: English.',
+  yellowFrom: 'Yellow from',
+  redFrom: 'Red from   ',
+  presets: 'Presets',
+  nowLabel: 'Now ',
+  zoneNow: { ok: ': under the zone', warn: ': yellow', over: ': red, the warning row and a toast' } as Record<Zone, string>,
+  resetTo: (t: Thresholds) => `Reset to ${t.warnAt}–${t.alertAt}`,
+  savedHint: 'Saved for every session · Esc closes',
+  counting: 'Counting tokens…',
+  refresh: 'Refresh',
+  categories: 'Categories',
+  onDemand: 'loaded on demand',
+  memoryFiles: 'Memory files',
+  mcpServers: 'MCP servers',
+  skills: 'Skills',
+  customAgents: 'Custom agents',
+  slashCommands: 'Slash commands',
+  toolsLoaded: (loaded: number, tools: number) => `${loaded}/${tools} tools loaded`,
+  skillsNote: (included: number, total: number, tokens: string) => `${included}/${total} listed, ${tokens} in all; largest shown`,
+  commandsNote: (included: number, total: number, tokens: string) => `${included}/${total} listed, ${tokens} tokens`,
+  lastCall: 'Last API call',
+  apiLine: (read: string, write: string, uncached: string, output: string) =>
+    `cache read ${read}  ·  cache write ${write}  ·  uncached ${uncached}  ·  output ${output}`,
+}
+
+const CATEGORY_RU: Record<string, string> = {
+  'System prompt': 'Системный промпт',
+  'System tools': 'Системные инструменты',
+  'MCP tools': 'MCP-инструменты',
+  'Custom agents': 'Свои агенты',
+  'Memory files': 'Файлы памяти',
+  Skills: 'Скиллы',
+  Messages: 'Сообщения',
+  'Free space': 'Свободно',
+  'Autocompact buffer': 'Буфер автосжатия',
+}
+
+const RU: typeof EN = {
+  units: { m: 'м', h: 'ч', d: 'д' },
+  compactsIn: 'сжатие через',
+  turns: n => (n < 1 ? '<1 хода' : `~${n} ${plural(n, 'ход', 'хода', 'ходов')}`),
+  limitLong: { five_hour: '5 часов', seven_day: 'неделя', spend_limit: 'расход' },
+  limitShort: { five_hour: '5ч', seven_day: '7д', spend_limit: 'расход' },
+  resetsIn: 'сброс через',
+  category: name => CATEGORY_RU[name] ?? name,
+  handoffAt: ago => (ago === undefined ? 'только что' : `${ago} назад`),
+  resume: 'продолжить',
+  dismiss: 'убрать',
+  pastZone: t => `⚠ за рабочей зоной (${t.warnAt}–${t.alertAt}%)`,
+  largest: 'больше всего',
+  cold: (idle, tokens) => `◌ кэш остыл, простой ${idle}: следующий ответ заново отправит ${tokens} без кэша`,
+  toast: (percent, hasHandoff) =>
+    `Контекст ${percent}%: за рабочей зоной. ${hasHandoff ? 'Handoff или /compact' : '/compact'} — в строке над полем ввода.`,
+  resumeText: path => `Прочитай ${path} и продолжи с того места.`,
+  description: 'Полоса контекста вкл/выкл; details: разбивка токенов; zone: где желтеет и краснеет; lang: en или ru',
+  barOn: 'Полоса контекста включена.',
+  barOff: 'Полоса контекста выключена.',
+  detailsOpened: 'Детали контекста открыты.',
+  detailsTitle: 'Детали контекста',
+  zoneUsage: 'Как вызвать: /context-bar zone, /context-bar zone 50 60, /context-bar zone reset',
+  zoneOpened: 'Рабочая зона открыта.',
+  zoneTitle: 'Рабочая зона',
+  zoneSet: t => `Рабочая зона: жёлтая от ${t.warnAt}%, красная от ${t.alertAt}%.`,
+  langUsage: 'Как вызвать: /context-bar lang en, /context-bar lang ru',
+  langSet: 'Язык: русский.',
+  yellowFrom: 'Жёлтая от ',
+  redFrom: 'Красная от',
+  presets: 'Пресеты',
+  nowLabel: 'Сейчас ',
+  zoneNow: { ok: ': ниже зоны', warn: ': жёлтая', over: ': красная, строка-предупреждение и уведомление' },
+  resetTo: t => `Сбросить на ${t.warnAt}–${t.alertAt}`,
+  savedHint: 'Сохраняется для всех сессий · Esc закрывает',
+  counting: 'Считаю токены…',
+  refresh: 'Обновить',
+  categories: 'Категории',
+  onDemand: 'загружается по запросу',
+  memoryFiles: 'Файлы памяти',
+  mcpServers: 'MCP-серверы',
+  skills: 'Скиллы',
+  customAgents: 'Свои агенты',
+  slashCommands: 'Слэш-команды',
+  toolsLoaded: (loaded, tools) => `загружено ${loaded} из ${tools} инструментов`,
+  skillsNote: (included, total, tokens) => `${included} из ${total} в списке, ${tokens} всего; показаны крупнейшие`,
+  commandsNote: (included, total, tokens) => `${included} из ${total} в списке, ${tokens} токенов`,
+  lastCall: 'Последний вызов API',
+  apiLine: (read, write, uncached, output) => `чтение кэша ${read}  ·  запись в кэш ${write}  ·  без кэша ${uncached}  ·  ответ ${output}`,
+}
+
+export type Words = typeof EN
+export const WORDS: Record<Lang, Words> = { en: EN, ru: RU }
+
 // Matt Pocock's handoff skill, when its plugin is installed: the command's name as typed.
 export const findHandoff = (commands: readonly { name: string; plugin?: string }[]) =>
   commands.find(c => c.plugin === 'mattpocock-skills' && /(^|:)handoff$/.test(c.name))?.name ??
@@ -93,27 +234,52 @@ export const short = (n: number) =>
 export const tiny = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1000)}k` : short(n)
 
-export const span = (ms: number) => {
+export const span = (ms: number, w: Words = EN) => {
+  const { m: mu, h: hu, d: du } = w.units
   const m = Math.max(0, Math.floor(ms / 60_000))
-  if (m < 60) return `${m}m`
+  if (m < 60) return `${m}${mu}`
   const hours = Math.floor(m / 60)
-  if (hours < 24) return `${hours}h${m % 60}m`
-  return `${Math.floor(hours / 24)}d${hours % 24}h`
+  if (hours < 24) return `${hours}${hu}${m % 60}${mu}`
+  return `${Math.floor(hours / 24)}${du}${hours % 24}${hu}`
+}
+
+// The pace after a turn ends at `total` tokens. A smaller window than the last turn's (a compact,
+// a /clear) starts it over; a turn that added nothing is not counted.
+export const nextPace = (pace: Pace | null, total: number): Pace => {
+  if (pace === null || total < pace.lastTotal) return { lastTotal: total, deltas: [] }
+  const grew = total - pace.lastTotal
+  return { lastTotal: total, deltas: grew > 0 ? [...pace.deltas, grew].slice(-PACE_TURNS) : pace.deltas }
+}
+
+// Whole turns at the recent pace before `compactIn` runs out; unknown until the pace has a few.
+export const turnsLeft = (compactIn: number, pace: Pace | null) => {
+  if (pace === null || pace.deltas.length < PACE_MIN_TURNS) return undefined
+  return Math.floor(compactIn / (pace.deltas.reduce((a, b) => a + b, 0) / pace.deltas.length))
 }
 
 // The figures beside the bar, all about this session's window: its size, then room before
-// auto-compaction.
-export const contextLine = (snap: Snapshot) =>
-  ` ${tiny(snap.total)}/${tiny(snap.max)}${snap.compactIn !== undefined ? ` · compacts in ${tiny(snap.compactIn)}` : ''}`
+// auto-compaction, and how many turns that room lasts at the recent pace.
+export const contextLine = (snap: Snapshot, turns?: number, w: Words = EN) =>
+  ` ${tiny(snap.total)}/${tiny(snap.max)}` +
+  (snap.compactIn !== undefined ? ` · ${w.compactsIn} ${tiny(snap.compactIn)}${turns !== undefined ? ` (${w.turns(turns)})` : ''}` : '')
+
+// What fills the window most, for the row under a yellow or red bar.
+export const largest = (segments: readonly Segment[]) =>
+  segments
+    .filter(s => s.kind === 'used')
+    .sort((a, b) => b.tokens - a.tokens)
+    .slice(0, LARGEST)
+
+export const cacheTtlOf = (limits: readonly Limit[]) => (limits.length > 0 ? CACHE_TTL_SUBSCRIPTION_MS : CACHE_TTL_MS)
 
 export type LimitPart = { label: string; percent: number; reset: string }
 // The account's rate limits, drawn apart from the window at the right end. Spelled out
 // (`5-hour`, `resets in`) where the line has room, in the short form (`5h`, `↻`) where it has not.
-export const limitParts = (limits: readonly Limit[], at: number, isShort: boolean): LimitPart[] =>
+export const limitParts = (limits: readonly Limit[], at: number, isShort: boolean, w: Words = EN): LimitPart[] =>
   limits.map(l => {
-    const label = (isShort ? LIMIT_SHORT : LIMIT_LONG)[l.kind] ?? l.kind
-    const left = l.resetsAt !== undefined && l.resetsAt > at ? span(l.resetsAt - at) : undefined
-    return { label, percent: l.percentUsed, reset: left === undefined ? '' : isShort ? ` ↻${left}` : ` resets in ${left}` }
+    const label = (isShort ? w.limitShort : w.limitLong)[l.kind] ?? l.kind
+    const left = l.resetsAt !== undefined && l.resetsAt > at ? span(l.resetsAt - at, w) : undefined
+    return { label, percent: l.percentUsed, reset: left === undefined ? '' : isShort ? ` ↻${left}` : ` ${w.resetsIn} ${left}` }
   })
 
 export const limitsText = (parts: readonly LimitPart[]) => parts.map(p => `${p.label} ${p.percent}%${p.reset}`).join(' · ')
@@ -165,7 +331,9 @@ export const handoffTitle = (content: string, path: string) => {
   return title || (path.split(/[\\/]/).pop() ?? path).replace(/\.md$/i, '')
 }
 
-export const resumeText = (path: string) => `Read ${path} and pick up from there.`
+export const resumeText = (path: string, w: Words = EN) => w.resumeText(path)
+
+const wordsIn = async ($: EngineInterface) => WORDS[(await $.state.get(langState)).value ?? 'en']
 
 let lastFetch = 0
 let isFetching = false
@@ -205,7 +373,7 @@ async function refresh($: EngineInterface, force = false) {
     const zone = zoneOf(next.percent, (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS)
     if (zone === 'over' && !hasAlerted) {
       hasAlerted = true
-      $.ui.toast(`Context ${next.percent}%: past the working zone. ${handoff ? 'Handoff or /compact' : '/compact'} from the row above the prompt.`)
+      $.ui.toast((await wordsIn($)).toast(next.percent, handoff !== undefined))
     } else if (zone === 'ok') hasAlerted = false
   } finally {
     isFetching = false
@@ -220,6 +388,7 @@ async function refreshDetails($: EngineInterface) {
   try {
     const b = (await $.session.usage({ breakdown: 'full' })).context.breakdown
     if (!b) return
+    const w = await wordsIn($)
     const servers = new Map<string, { tokens: number; tools: number; loaded: number }>()
     for (const t of b.mcpTools) {
       const s = servers.get(t.serverName) ?? { tokens: 0, tools: 0, loaded: 0 }
@@ -232,7 +401,7 @@ async function refreshDetails($: EngineInterface) {
       categories: b.categories.filter(c => c.tokens > 0).map(c => ({ name: c.name, color: c.color, tokens: c.tokens, kind: c.kind })),
       memoryFiles: b.memoryFiles.map(f => ({ name: tail(f.path), tokens: f.tokens, note: f.type })).sort(byTokens),
       mcpServers: [...servers]
-        .map(([name, s]) => ({ name, tokens: s.tokens, note: `${s.loaded}/${s.tools} tools loaded` }))
+        .map(([name, s]) => ({ name, tokens: s.tokens, note: w.toolsLoaded(s.loaded, s.tools) }))
         .sort(byTokens),
       agents: b.agents.map(a => ({ name: a.agentType, tokens: a.tokens, note: a.source })).sort(byTokens),
       api: b.apiUsage && {
@@ -260,9 +429,18 @@ async function refreshDetails($: EngineInterface) {
   }
 }
 
+// After a turn of the main loop: a fresh read, the window's growth for the pace, and, when the
+// model answered, the time the prompt cache counts from.
+async function afterTurn($: EngineInterface, hasReplied: boolean) {
+  await refresh($, true)
+  const snap = (await $.state.get(snapshot)).value ?? null
+  if (snap) await $.state.set(paceState, nextPace((await $.state.get(paceState)).value ?? null, snap.total))
+  if (hasReplied) await $.state.set(repliedAt, await $.clock.now())
+}
+
 async function openDetails($: EngineInterface) {
   await $.state.set(isDetailsOpen, true)
-  await $.ui.open({ id: PANE, title: 'Context details' })
+  await $.ui.open({ id: PANE, title: (await wordsIn($)).detailsTitle })
   await refreshDetails($).catch(() => {})
 }
 
@@ -285,7 +463,10 @@ async function offerHandoff($: EngineInterface, cwd: string) {
   const at = await $.clock.now()
   const isLive = saved !== undefined && at - saved.at < HANDOFF_MAX_AGE_MS && (await $.fs.exists(saved.path).catch(() => false))
   await $.state.set(offer, isLive ? saved : null)
-  if (isLive) void $.clock.sleep(300).then(() => $.prompt.suggest({ text: resumeText(saved.path) })).catch(() => {})
+  if (isLive) {
+    const text = resumeText(saved.path, await wordsIn($))
+    void $.clock.sleep(300).then(() => $.prompt.suggest({ text })).catch(() => {})
+  }
 }
 
 async function forgetHandoff($: EngineInterface, spent: Handoff) {
@@ -300,10 +481,12 @@ async function forgetHandoff($: EngineInterface, spent: Handoff) {
 export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
+    const lang = await $.store.get(LANG_KEY).catch(() => undefined)
+    await $.state.set(langState, lang === 'ru' ? 'ru' : 'en')
     await $.command.register({
       name: 'context-bar',
-      description: 'Toggle the context bar; details: token breakdown; zone: set where it turns yellow and red',
-      argumentHint: '[details | zone [<yellow%> <red%> | reset]]',
+      description: (await wordsIn($)).description,
+      argumentHint: '[details | zone [<yellow%> <red%> | reset] | lang en|ru]',
     })
     // Only a session that draws the band needs the minute ticker; a reload drops
     // the old module's timers, and the cancel covers session.start firing twice in one load.
@@ -319,14 +502,21 @@ export const register: Register = on => {
     await refresh($, true).catch(() => {})
     const isReload = (await $.state.get(hasStarted)).value ?? false
     await $.state.set(hasStarted, true)
-    if (e.isInteractive && !isReload) await offerHandoff($, await $.session.root()).catch(() => {})
+    const root = await $.session.root().catch(() => undefined)
+    if (e.isInteractive && !isReload && root !== undefined) await offerHandoff($, root).catch(() => {})
     return next(e)
   })
 
   // A /clear starts no session.start: the conversation that follows is offered the handoff here.
   on('session.end', async ($, e, next) => {
     const ended = await next(e)
-    if (e.reason === 'clear') await offerHandoff($, await $.session.root()).catch(() => {})
+    if (e.reason === 'clear') {
+      // A new conversation: no pace yet, and no cache of its own to lose.
+      await $.state.set(paceState, null)
+      await $.state.set(repliedAt, 0)
+      const root = await $.session.root().catch(() => undefined)
+      if (root !== undefined) await offerHandoff($, root).catch(() => {})
+    }
     return ended
   })
 
@@ -355,25 +545,34 @@ export const register: Register = on => {
 
   on('command.run', { command: 'context-bar' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    const w = await wordsIn($)
     if (verb.toLowerCase() === 'details') {
       await openDetails($)
-      return { text: 'Context details opened.' }
+      return { text: w.detailsOpened }
     }
     if (verb.toLowerCase() === 'zone') {
       const asked = parseZone(rest.join(' '))
-      if (asked === undefined) return { text: 'Usage: /context-bar zone, /context-bar zone 50 60, /context-bar zone reset' }
+      if (asked === undefined) return { text: w.zoneUsage }
       if (asked === 'open') {
-        await $.ui.open({ id: ZONE_PANE, title: 'Working zone', focus: true, closeOnEscape: true })
-        return { text: 'Working zone opened.' }
+        await $.ui.open({ id: ZONE_PANE, title: w.zoneTitle, focus: true, closeOnEscape: true })
+        return { text: w.zoneOpened }
       }
       await setZone($, asked)
-      const t = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
-      return { text: `Working zone: yellow from ${t.warnAt}%, red from ${t.alertAt}%.` }
+      return { text: w.zoneSet((await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS) }
+    }
+    if (verb.toLowerCase() === 'lang') {
+      const asked = rest[0]?.toLowerCase()
+      if (asked !== 'en' && asked !== 'ru') return { text: w.langUsage }
+      await $.state.set(langState, asked)
+      await $.store.set(LANG_KEY, asked)
+      // The breakdown's notes are worded when read: read it again in the new language.
+      if ((await $.state.get(isDetailsOpen)).value ?? false) void refreshDetails($).catch(() => {})
+      return { text: WORDS[asked].langSet }
     }
     const nextOn = !((await $.state.get(isOn)).value ?? true)
     await $.state.set(isOn, nextOn)
     if (nextOn) await refresh($, true)
-    return { text: nextOn ? 'Context bar on.' : 'Context bar off.' }
+    return { text: nextOn ? w.barOn : w.barOff }
   })
 
   on('ui.close', async ($, e, next) => {
@@ -387,8 +586,10 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // A subagent's turns fill its own window, not this one.
+    if (e.agentId !== undefined) return next(e)
     isHandingOff = false
-    void refresh($, true)
+    void afterTurn($, e.usage !== undefined).catch(() => {})
     if ((await $.state.get(isDetailsOpen)).value ?? false) void refreshDetails($).catch(() => {})
     return next(e)
   })
@@ -401,6 +602,7 @@ export const register: Register = on => {
     if (!hasBar && !waiting) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
+    const w = await wordsIn($)
     const at = (await $.state.get(now)).value ?? 0
     // The buttons put the command in the prompt box rather than run it: a handoff wants to be
     // told what the next session is for, and either can still be thought better of.
@@ -411,11 +613,11 @@ export const register: Register = on => {
       <Box flexDirection="row" gap={1}>
         <Box flexShrink={1}>
           <Text wrap="truncate" color="suggestion" bold>
-            ↩ handoff {at - waiting.at < 60_000 ? 'just now' : `${span(at - waiting.at)} ago`}: {waiting.title}
+            ↩ handoff {w.handoffAt(at - waiting.at < 60_000 ? undefined : span(at - waiting.at, w))}: {waiting.title}
           </Text>
         </Box>
-        <Button key="resume" label="resume" hotkey="r" plain onPress={() => fill(resumeText(waiting.path))} />
-        <Button key="dismiss" label="dismiss" hotkey="x" plain dimColor onPress={() => void forgetHandoff($, waiting)} />
+        <Button key="resume" label={w.resume} hotkey="r" plain onPress={() => fill(resumeText(waiting.path, w))} />
+        <Button key="dismiss" label={w.dismiss} hotkey="x" plain dimColor onPress={() => void forgetHandoff($, waiting)} />
       </Box>
     ) : null
     if (!hasBar)
@@ -429,17 +631,18 @@ export const register: Register = on => {
     const thresholds = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
-    const context = contextLine(snap)
+    const pace = (await $.state.get(paceState)).value ?? null
+    const context = contextLine(snap, snap.compactIn !== undefined ? turnsLeft(snap.compactIn, pace) : undefined, w)
     // The widest layout that fits: the long labels beside a full bar, else the short labels and
     // a bar narrowed to the room left; past that the line is cut at its end.
     const roomFor = (isShort: boolean) => {
-      const right = limitsText(limitParts(snap.limits, at, isShort)).length
+      const right = limitsText(limitParts(snap.limits, at, isShort, w)).length
       return e.props.bodyColumns - figure.length - context.length - (right > 0 ? GAP + right : 0)
     }
     const isShort = roomFor(false) < BAR_CELLS
     const width = isShort ? Math.max(8, Math.min(BAR_CELLS, roomFor(true))) : BAR_CELLS
     const cells = allocate(snap.segments, snap.max, width)
-    const limits = limitParts(snap.limits, at, isShort)
+    const limits = limitParts(snap.limits, at, isShort, w)
     const left = (
       <Text wrap="truncate">
         {snap.segments.map((s, i) =>
@@ -476,26 +679,49 @@ export const register: Register = on => {
         {right}
       </Box>
     )
-    // The band is shared: what the plugins beneath draw there stays, under the bar.
-    const below = await next(e)
-    if (zone !== 'over' || e.props.maxRows < 2)
-      return (
-        <Box flexDirection="column">
-          {bar}
-          {resume}
-          {below}
-        </Box>
-      )
-    return (
-      <Box flexDirection="column">
-        {bar}
+    // Past the zone: what to do about it.
+    const over =
+      zone === 'over' ? (
         <Box flexDirection="row" gap={1}>
-          <Text color="error">
-            ⚠ past the working zone ({thresholds.warnAt}–{thresholds.alertAt}%)
-          </Text>
+          <Text color="error">{w.pastZone(thresholds)}</Text>
           {handoff ? <Button key="handoff" label="handoff" hotkey="h" plain onPress={() => fill(`/${handoff} `)} /> : null}
           <Button key="compact" label="/compact" hotkey="c" plain onPress={() => fill('/compact ')} />
         </Box>
+      ) : null
+    // Yellow or red: what fills the window, in the bar's colours, so the cure is plain.
+    const top =
+      zone === 'ok' ? null : (
+        <Text wrap="truncate">
+          <Text dimColor>{w.largest} </Text>
+          {largest(snap.segments).map((s, i) => (
+            <Text>
+              {i > 0 ? <Text dimColor> · </Text> : null}
+              <Text color={s.color}>■</Text> {w.category(s.name)} <Text color={ZONE_COLOR[zone]}>{tiny(s.tokens)}</Text>
+            </Text>
+          ))}
+        </Text>
+      )
+    // Idle past the prompt cache's life: the next reply sends the whole window again uncached, and
+    // a handoff into a fresh conversation may cost less.
+    const replied = (await $.state.get(repliedAt)).value ?? 0
+    const cold =
+      replied > 0 && at - replied >= cacheTtlOf(snap.limits) ? (
+        <Box flexDirection="row" gap={1}>
+          <Box flexShrink={1}>
+            <Text wrap="truncate" color="warning">
+              {w.cold(span(at - replied, w), tiny(snap.total))}
+            </Text>
+          </Box>
+          {handoff && !over ? <Button key="cold-handoff" label="handoff" hotkey="h" plain onPress={() => fill(`/${handoff} `)} /> : null}
+        </Box>
+      ) : null
+    // The band is shared: what the plugins beneath draw there stays, under the bar.
+    const below = await next(e)
+    const rows = [over, top, cold].filter(r => r !== null).slice(0, Math.max(0, e.props.maxRows - 1))
+    return (
+      <Box flexDirection="column">
+        {bar}
+        {rows}
         {resume}
         {below}
       </Box>
@@ -504,6 +730,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: ZONE_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    const w = await wordsIn($)
     const t = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
     const snap = (await $.state.get(snapshot)).value ?? null
     const step = (which: keyof Thresholds, label: string, color: string) => (
@@ -517,10 +744,10 @@ export const register: Register = on => {
     const zone = snap ? zoneOf(snap.percent, t) : undefined
     return (
       <Box flexDirection="column">
-        {step('warnAt', 'Yellow from', 'warning')}
-        {step('alertAt', 'Red from   ', 'error')}
+        {step('warnAt', w.yellowFrom, 'warning')}
+        {step('alertAt', w.redFrom, 'error')}
         <Box flexDirection="row" gap={1} marginTop={1}>
-          <Text dimColor>Presets</Text>
+          <Text dimColor>{w.presets}</Text>
           {PRESETS.map((p, i) => (
             <Button
               key={`preset-${i + 1}`}
@@ -533,18 +760,16 @@ export const register: Register = on => {
         </Box>
         {snap && zone ? (
           <Text>
-            <Text dimColor>Now </Text>
+            <Text dimColor>{w.nowLabel}</Text>
             <Text color={ZONE_COLOR[zone]} bold>
               {snap.percent}%
             </Text>
-            <Text dimColor>
-              {zone === 'ok' ? ': under the zone' : zone === 'warn' ? ': yellow' : ': red, the warning row and a toast'}
-            </Text>
+            <Text dimColor>{w.zoneNow[zone]}</Text>
           </Text>
         ) : null}
         <Box flexDirection="row" gap={1} marginTop={1}>
-          <Button key="reset" label={`Reset to ${DEFAULT_THRESHOLDS.warnAt}–${DEFAULT_THRESHOLDS.alertAt}`} hotkey="r" dimColor onPress={() => void setZone($, 'reset')} />
-          <Text dimColor>Saved for every session · Esc closes</Text>
+          <Button key="reset" label={w.resetTo(DEFAULT_THRESHOLDS)} hotkey="r" dimColor onPress={() => void setZone($, 'reset')} />
+          <Text dimColor>{w.savedHint}</Text>
         </Box>
       </Box>
     )
@@ -552,12 +777,13 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    const w = await wordsIn($)
     const d = (await $.state.get(details)).value ?? null
-    const refreshButton = <Button key="refresh" label="Refresh" hotkey="r" dimColor onPress={() => refreshDetails($).catch(() => {})} />
+    const refreshButton = <Button key="refresh" label={w.refresh} hotkey="r" dimColor onPress={() => refreshDetails($).catch(() => {})} />
     if (!d)
       return (
         <Box flexDirection="column">
-          <Text dimColor>Counting tokens…</Text>
+          <Text dimColor>{w.counting}</Text>
           {refreshButton}
         </Box>
       )
@@ -599,28 +825,28 @@ export const register: Register = on => {
           </Text>
         </Text>
         <Box flexDirection="column" marginTop={1}>
-          <Text bold>Categories</Text>
-          {d.categories.map(c => line({ name: c.name, tokens: c.tokens, note: c.kind === 'deferred' ? 'loaded on demand' : undefined }, c.color))}
+          <Text bold>{w.categories}</Text>
+          {d.categories.map(c => line({ name: w.category(c.name), tokens: c.tokens, note: c.kind === 'deferred' ? w.onDemand : undefined }, c.color))}
         </Box>
-        {section('Memory files', d.memoryFiles)}
-        {section('MCP servers', d.mcpServers)}
-        {d.skills ? section('Skills', d.skills.top, `${d.skills.included}/${d.skills.total} listed, ${short(d.skills.tokens)} in all; largest shown`) : null}
-        {section('Custom agents', d.agents)}
+        {section(w.memoryFiles, d.memoryFiles)}
+        {section(w.mcpServers, d.mcpServers)}
+        {d.skills ? section(w.skills, d.skills.top, w.skillsNote(d.skills.included, d.skills.total, short(d.skills.tokens))) : null}
+        {section(w.customAgents, d.agents)}
         {d.commands ? (
           <Box flexDirection="column" marginTop={1}>
-            <Text bold>Slash commands</Text>
+            <Text bold>{w.slashCommands}</Text>
             <Text dimColor>
               {'  '}
-              {d.commands.included}/{d.commands.total} listed, {short(d.commands.tokens)} tokens
+              {w.commandsNote(d.commands.included, d.commands.total, short(d.commands.tokens))}
             </Text>
           </Box>
         ) : null}
         {d.api ? (
           <Box flexDirection="column" marginTop={1}>
-            <Text bold>Last API call</Text>
+            <Text bold>{w.lastCall}</Text>
             <Text dimColor>
-              {'  '}cache read {short(d.api.cacheRead)}  ·  cache write {short(d.api.cacheWrite)}  ·  uncached {short(d.api.uncached)}  ·  output{' '}
-              {short(d.api.output)}
+              {'  '}
+              {w.apiLine(short(d.api.cacheRead), short(d.api.cacheWrite), short(d.api.uncached), short(d.api.output))}
             </Text>
           </Box>
         ) : null}

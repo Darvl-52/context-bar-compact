@@ -31,8 +31,15 @@ export type Thresholds = { warnAt: number; alertAt: number }
 // A handoff document written in a session, offered to the next one in the same folder.
 export type Handoff = { path: string; cwd: string; at: number; title: string }
 
+// How the window grew over the last turns of the main loop: the tokens at the latest turn's end
+// and what each counted turn added.
+export type Pace = { lastTotal: number; deltas: number[] }
+
+// The language the mod speaks: /context-bar lang picks it and the store keeps it.
+export type Lang = 'en' | 'ru'
+
 declare module 'claude-code' {
   interface PluginState {
-    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds; handoff: Handoff | null; hasStarted: boolean }
+    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds; handoff: Handoff | null; hasStarted: boolean; pace: Pace | null; repliedAt: number; lang: Lang }
   }
 }

@@ -4,7 +4,7 @@ A Claude Code mod: one line above the prompt, with how full this session's conte
 the left and your account's rate limits on the right.
 
 ```
-██████░░░░░░░░░░░▒▒▒ 30% 60k/200k · compacts in 100k             5-hour 42% resets in 2h14m · weekly 18%
+██████░░░░░░░░░░░▒▒▒ 30% 60k/200k · compacts in 100k (~10 turns)     5-hour 42% resets in 2h14m · weekly 18%
 ```
 
 **On the left, this session's window**
@@ -16,6 +16,9 @@ the left and your account's rate limits on the right.
 - `60k/200k` tokens in the window out of its size.
 - `compacts in 100k` how many tokens are left before Claude Code compacts the conversation; absent
   when auto-compaction is off.
+- `(~10 turns)` how many of your turns that room lasts at the pace of the last five, so you know
+  whether the task fits before a compact. It shows from the third turn of a conversation and starts
+  over after a compact or `/clear`; what subagents read does not count, it fills their own window.
 
 **On the right, your account's rate limits** (subscription accounts only)
 
@@ -37,12 +40,15 @@ Other mods that draw rows above the prompt keep them, under this line.
 Answers get worse well before the window is full, so the bar watches the share in use:
 
 - under 50% the figure is green;
-- from 50% it turns yellow;
-- from 60% it turns red, a toast says so once, and a second row offers a way out:
+- from 50% it turns yellow, and a row names the three categories that fill the window most, each
+  with the colour it has on the bar, so you see whether a compact, a handoff or turning off an MCP
+  server would help;
+- from 60% it turns red, a toast says so once, and another row offers a way out:
 
 ```
-█████████████░░░▒▒▒▒ 62% 124k/200k · compacts in 36k             5-hour 42% resets in 2h14m · weekly 18%
+█████████████░░░▒▒▒▒ 62% 124k/200k · compacts in 36k (~3 turns)  5-hour 42% resets in 2h14m · weekly 18%
 ⚠ past the working zone (50–60%)  h: handoff  c: /compact
+largest ■ Messages 98k · ■ System tools 16k · ■ Memory files 6k
 ```
 
 `c` puts `/compact ` in the prompt box. `h` appears when Matt Pocock's
@@ -51,6 +57,32 @@ and puts `/mattpocock-skills:handoff ` there, for you to finish with what the ne
 it writes the conversation to a file in your temp directory that a fresh session can read and pick
 up. Neither runs until you press Enter. The toast comes back only after the window has dropped
 under 50% again, say after a compact.
+
+### A cold cache
+
+Claude Code keeps the conversation in the prompt cache for an hour on a subscription and five
+minutes otherwise. Away longer than that, the next reply sends the whole window again uncached,
+which costs more and counts more against your limits. The bar says so once the time is up:
+
+```
+◌ cache cold after 1h12m idle: the next reply re-sends 124k uncached  h: handoff
+```
+
+A handoff into a fresh conversation, then `/clear`, may cost less than carrying on. The row goes
+away with the next reply. A mod cannot read the cache setting, so a session with rate limits on the
+right (a subscription) is taken for the hour.
+
+### In Russian
+
+`/context-bar lang ru` switches every word the mod shows to Russian, and the choice is kept for
+every session:
+
+```
+██████░░░░░░░░░░░▒▒▒ 30% 60k/200k · сжатие через 100k (~10 ходов)   5 часов 42% сброс через 2ч14м · неделя 18%
+```
+
+Claude Code names the window's categories in English; the Russian side translates the ones it
+knows (`Messages` is `Сообщения`) and leaves a new one as it is. `/context-bar lang en` goes back.
 
 ### Picking up a handoff
 
@@ -83,6 +115,7 @@ session. Without the pane, `/context-bar zone 40 70` sets yellow from 40% and re
 | `/context-bar zone`       | Open the working-zone pane: −/+ for yellow and red, presets `1`–`4`, `r` resets.                                                                                                                                    |
 | `/context-bar zone 40 70` | Yellow from 40%, red from 70%, without the pane.                                                                                                                                                                    |
 | `/context-bar zone reset` | Back to 50–60.                                                                                                                                                                                                      |
+| `/context-bar lang ru`    | Speak Russian: the bar, its rows, the panes, the toast and the command's replies; `lang en` back to English. Kept for every session.                                                                                |
 
 Keys on the warning and handoff rows, once the band has the focus (a click, or ctrl+x tab):
 
@@ -98,6 +131,9 @@ nothing anywhere. The details pane costs a few extra requests, like running `/co
 refreshes only while it is open.
 
 ## Install
+
+Needs Claude Code 2.1.281 or later, the first with the session state mods keep their values in;
+on an older one the mod loads but draws nothing. `claude --version` tells, `claude update` updates.
 
 At the prompt of a Claude Code session:
 

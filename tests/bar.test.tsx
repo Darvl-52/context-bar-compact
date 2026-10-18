@@ -2,7 +2,25 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { ContextCategory, SessionUsage } from 'claude-code'
 import type { TestBody } from 'claude-code/testing'
 
-import { allocate, findHandoff, handoffTitle, isHandoffFile, limitColor, nudge, resumeText, parseZone, thresholdsOf, zoneOf } from '../hooks/register'
+import {
+  allocate,
+  cacheTtlOf,
+  contextLine,
+  findHandoff,
+  handoffTitle,
+  isHandoffFile,
+  largest,
+  limitColor,
+  nextPace,
+  span,
+  nudge,
+  resumeText,
+  parseZone,
+  thresholdsOf,
+  turnsLeft,
+  WORDS,
+  zoneOf,
+} from '../hooks/register'
 
 const row = (name: string, tokens: number, color: string, kind: ContextCategory['kind']): ContextCategory => ({
   name,
@@ -551,4 +569,143 @@ test('the handoff row shows with the bar off, and any other prompt puts it away'
   expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
   await ui.unmount()
   expect(store.get('handoffs')).toEqual({ '/proj': h })
+})
+
+test('the pace: turns left once two turns are counted, started over by a compact', () => {
+  let pace = nextPace(null, 40_000)
+  expect(turnsLeft(100_000, pace)).toBeUndefined()
+  pace = nextPace(pace, 50_000)
+  // A turn that added nothing is not counted.
+  pace = nextPace(pace, 50_000)
+  expect(turnsLeft(100_000, pace)).toBeUndefined()
+  pace = nextPace(pace, 80_000)
+  expect(pace.deltas).toEqual([10_000, 30_000])
+  expect(turnsLeft(100_000, pace)).toBe(5)
+  expect(nextPace(pace, 20_000)).toEqual({ lastTotal: 20_000, deltas: [] })
+  for (let t = 80_000; t < 200_000; t += 10_000) pace = nextPace(pace, t + 10_000)
+  expect(pace.deltas).toEqual([10_000, 10_000, 10_000, 10_000, 10_000])
+
+  const snap = { segments: [], total: 60_000, max: 200_000, percent: 30, startedAt: 0, limits: [], compactIn: 100_000 }
+  expect(contextLine(snap, 6)).toBe(' 60k/200k · compacts in 100k (~6 turns)')
+  expect(contextLine(snap, 1)).toBe(' 60k/200k · compacts in 100k (~1 turn)')
+  expect(contextLine(snap, 0)).toBe(' 60k/200k · compacts in 100k (<1 turn)')
+  expect(contextLine(snap)).toBe(' 60k/200k · compacts in 100k')
+})
+
+test('the largest categories are the used ones, biggest first; the cache lives an hour on a subscription', () => {
+  const segs = [
+    { name: 'System prompt', color: 'a', tokens: 4_000, kind: 'used' as const },
+    { name: 'Free space', color: 'b', tokens: 107_000, kind: 'free' as const },
+    { name: 'Messages', color: 'c', tokens: 56_000, kind: 'used' as const },
+    { name: 'Memory files', color: 'd', tokens: 6_000, kind: 'used' as const },
+    { name: 'Skills', color: 'e', tokens: 1_000, kind: 'used' as const },
+  ]
+  expect(largest(segs).map(s => s.name)).toEqual(['Messages', 'Memory files', 'System prompt'])
+  expect(cacheTtlOf([])).toBe(5 * 60_000)
+  expect(cacheTtlOf([{ kind: 'five_hour', percentUsed: 1 }])).toBe(HOUR)
+})
+
+test('in the yellow and red the band names what fills the window', async ($, on) => {
+  const { turn } = await zoneSession($, on, [])
+  let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^largest ■ Messages 56k · ■ System prompt 4\.0k$/ })).toBeDefined()
+  await ui.unmount()
+  await turn(at(55))
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^largest/ })).toBeDefined()
+  await ui.unmount()
+  await turn(at(30))
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^largest/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('turns left at the recent pace, and a cold cache after an hour idle', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 + 2 * HOUR })
+  let usage = RICH
+  on('session.usage', () => ({ value: usage }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.list', () => ({ value: [] }))
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
+  const used = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'test' }
+  let turns = 0
+  const turnEnd = async (total: number, agentId?: string) => {
+    usage = { ...RICH, context: { ...RICH.context, breakdown: { ...RICH.context.breakdown!, totalTokens: total } } }
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: `t${++turns}`, reason: 'answer', usage: used, ...(agentId ? { agentId } : {}) })
+    await clock.advance(10)
+  }
+  const wide = { ...BAND, props: { ...BAND.props, bodyColumns: 160 } }
+
+  await turnEnd(40_000)
+  await turnEnd(50_000)
+  let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...wide })
+  expect(await ui.find({ type: 'Text', text: /compacts in 110k$/ })).toBeDefined()
+  await ui.unmount()
+  // A subagent's turn fills its own window: it moves neither the pace nor the cache's clock.
+  await turnEnd(60_000)
+  await turnEnd(90_000, 'agent-1')
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...wide })
+  expect(await ui.find({ type: 'Text', text: /compacts in 100k \(~10 turns\)$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /cache cold/ })).toBeUndefined()
+  await ui.unmount()
+
+  await clock.advance(HOUR + 60_000)
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...wide })
+  expect(await ui.find({ type: 'Text', text: /^◌ cache cold after 1h\d+m idle: the next reply re-sends 60k uncached$/ })).toBeDefined()
+  await ui.unmount()
+
+  await turnEnd(65_000)
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...wide })
+  expect(await ui.find({ type: 'Text', text: /cache cold/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Russian words: turns and time in Russian forms', () => {
+  const ru = WORDS.ru
+  expect([0, 1, 2, 5, 11, 21, 22, 112].map(n => ru.turns(n))).toEqual(['<1 хода', '~1 ход', '~2 хода', '~5 ходов', '~11 ходов', '~21 ход', '~22 хода', '~112 ходов'])
+  expect(span(2 * HOUR + 14 * 60_000, ru)).toBe('2ч14м')
+  expect(span(50 * HOUR, ru)).toBe('2д2ч')
+  expect(ru.category('Messages')).toBe('Сообщения')
+  expect(ru.category('Something new')).toBe('Something new')
+})
+
+test('/context-bar lang ru speaks Russian, and the next session keeps it', async ($, on) => {
+  mock.clock(on, { now: 1_000 + 2 * HOUR })
+  mock.store(on, {})
+  on('session.usage', () => ({ value: RICH }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.list', () => ({ value: [] }))
+  const registered: string[] = []
+  on('command.register', ($, e) => {
+    registered.push(e.description)
+    return { value: { command: 'context-bar' } }
+  })
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
+  const run = (args: string) =>
+    $.command.run({ command: 'context-bar', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+  expect((await run('lang de')).text).toBe('Usage: /context-bar lang en, /context-bar lang ru')
+  expect((await run('lang ru')).text).toBe('Язык: русский.')
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /30% 60k\/200k · сжатие через 100k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^5ч 42% ↻2ч14м · 7д 18%$/ })).toBeDefined()
+  await ui.unmount()
+  expect((await run('')).text).toBe('Полоса контекста выключена.')
+  expect((await run('zone 40 70')).text).toBe('Рабочая зона: жёлтая от 40%, красная от 70%.')
+
+  // A new session reads the language back before it registers the command.
+  await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
+  expect(registered.at(-1)).toMatch(/^Полоса контекста вкл\/выкл/)
+  expect((await run('lang en')).text).toBe('Language: English.')
+  expect(registered[0]).toMatch(/^Toggle the context bar/)
 })

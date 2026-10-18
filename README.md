@@ -33,6 +33,15 @@ it writes the conversation to a file in your temp directory that a fresh session
 up. Neither runs until you press Enter. The toast comes back only after the window has dropped
 under 50% again, say after a compact.
 
+Both thresholds are settings: `/plugin configure context-bar-compact` sets `warn_at` (yellow,
+default 50) and `alert_at` (red, the toast and the row; default 60), each a percentage of the
+window. A pair given the wrong way round is swapped; a value outside 1–100 falls back to its
+default. From a shell:
+
+```sh
+echo '{"warn_at": 40, "alert_at": 70}' | claude plugin configure context-bar-compact --values-stdin
+```
+
 `/context-bar` hides or shows the bar for the session. `/context-bar details` opens a pane with the
 full breakdown: each category, memory files, MCP servers and how many of their tools are loaded,
 the largest skills, custom agents and the cache split of the last API call.

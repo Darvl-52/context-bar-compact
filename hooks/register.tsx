@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, SessionRateLimit } from 'claude-code'
 
 import type { Details, Limit, Row, Segment, Snapshot } from '../types'
 
@@ -17,13 +17,25 @@ const BAR_CELLS = 20
 const REFRESH_MS = 3000
 const TICK_MS = 60_000
 const LIMIT_LABEL: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
-// The working zone of the window: past WARN_AT the figure turns yellow, past ALERT_AT red,
-// with a toast once and a row offering a handoff or /compact.
-export const WARN_AT = 50
-export const ALERT_AT = 60
+// The working zone of the window: from `warnAt` the figure turns yellow, from `alertAt` red,
+// with a toast once and a row offering a handoff or /compact. Both are the plugin's options
+// (warn_at, alert_at in /plugin configure); these are the defaults.
+export type Thresholds = { warnAt: number; alertAt: number }
+export const DEFAULT_THRESHOLDS: Thresholds = { warnAt: 50, alertAt: 60 }
+
+// A value that is no number, or out of 1–100, falls back to its default; a pair given the wrong
+// way round is swapped rather than refused, the intent being plain.
+export const thresholdsOf = (options: PluginOptions): Thresholds => {
+  const pick = (value: unknown, fallback: number) =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 1 && value <= 100 ? value : fallback
+  const warnAt = pick(options.warn_at, DEFAULT_THRESHOLDS.warnAt)
+  const alertAt = pick(options.alert_at, DEFAULT_THRESHOLDS.alertAt)
+  return alertAt >= warnAt ? { warnAt, alertAt } : { warnAt: alertAt, alertAt: warnAt }
+}
 
 export type Zone = 'ok' | 'warn' | 'over'
-export const zoneOf = (percent: number): Zone => (percent >= ALERT_AT ? 'over' : percent >= WARN_AT ? 'warn' : 'ok')
+export const zoneOf = (percent: number, t: Thresholds = DEFAULT_THRESHOLDS): Zone =>
+  percent >= t.alertAt ? 'over' : percent >= t.warnAt ? 'warn' : 'ok'
 const ZONE_COLOR: Record<Zone, string | undefined> = { ok: undefined, warn: 'warning', over: 'error' }
 
 // Matt Pocock's handoff skill, when its plugin is installed: the command's name as typed.
@@ -94,7 +106,8 @@ let isFetching = false
 let isFetchingDetails = false
 let tick: { cancel: () => void } | undefined
 let handoff: string | undefined
-// Raised once past ALERT_AT; lowered when the window drops back under WARN_AT, after a compact.
+let thresholds = DEFAULT_THRESHOLDS
+// Raised once past the zone; lowered when the window drops back under its start, after a compact.
 let hasAlerted = false
 
 async function refresh($: EngineInterface, force = false) {
@@ -122,7 +135,7 @@ async function refresh($: EngineInterface, force = false) {
     // Time first, so the new snapshot never draws against a stale clock.
     await update($, now, () => at)
     await update($, snapshot, () => next)
-    const zone = zoneOf(next.percent)
+    const zone = zoneOf(next.percent, thresholds)
     if (zone === 'over' && !hasAlerted) {
       hasAlerted = true
       $.ui.toast(`Context ${next.percent}%: past the working zone. ${handoff ? 'Handoff or /compact' : '/compact'} from the row above the prompt.`)
@@ -186,7 +199,9 @@ async function openDetails($: EngineInterface) {
   await refreshDetails($).catch(() => {})
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  thresholds = thresholdsOf(options)
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'context-bar',
@@ -239,7 +254,7 @@ export const register: Register = on => {
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const info = infoLine(snap, await read($, now))
-    const zone = zoneOf(snap.percent)
+    const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
     const summary = ` ${tiny(snap.total)}/${tiny(snap.max)}${info ? ` · ${info}` : ''}`
     // A short bar, narrower still when the summary would not fit beside it.
@@ -269,7 +284,9 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {bar}
         <Box flexDirection="row" gap={1}>
-          <Text color="error">⚠ past the working zone ({WARN_AT}–{ALERT_AT}%)</Text>
+          <Text color="error">
+            ⚠ past the working zone ({thresholds.warnAt}–{thresholds.alertAt}%)
+          </Text>
           {handoff ? <Button key="handoff" label="handoff" hotkey="h" plain onPress={() => fill(`/${handoff} `)} /> : null}
           <Button key="compact" label="/compact" hotkey="c" plain onPress={() => fill('/compact ')} />
         </Box>

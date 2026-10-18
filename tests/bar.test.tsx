@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { ContextCategory, SessionUsage } from 'claude-code'
 import type { TestBody } from 'claude-code/testing'
 
-import { allocate, findHandoff, zoneOf } from '../hooks/register'
+import { allocate, findHandoff, thresholdsOf, zoneOf } from '../hooks/register'
 
 const row = (name: string, tokens: number, color: string, kind: ContextCategory['kind']): ContextCategory => ({
   name,
@@ -222,7 +222,7 @@ const at = (percent: number): SessionUsage => ({
 })
 
 test('the working zone: plain under 50%, a warning from 50%, past it from 60%', () => {
-  expect([49, 50, 59, 60, 95].map(zoneOf)).toEqual(['ok', 'warn', 'warn', 'over', 'over'])
+  expect([49, 50, 59, 60, 95].map(p => zoneOf(p))).toEqual(['ok', 'warn', 'warn', 'over', 'over'])
 })
 
 test('the handoff command is found by name, Matt Pocock\'s first', () => {
@@ -307,5 +307,25 @@ test('under 60% there is no warning row', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
   expect(await ui.find({ type: 'Text', text: /55%/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /working zone/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the thresholds come from the options, with defaults and the pair kept in order', () => {
+  expect(thresholdsOf({})).toEqual({ warnAt: 50, alertAt: 60 })
+  expect(thresholdsOf({ warn_at: 40, alert_at: 70 })).toEqual({ warnAt: 40, alertAt: 70 })
+  expect(thresholdsOf({ warn_at: 80, alert_at: 70 })).toEqual({ warnAt: 70, alertAt: 80 })
+  expect(thresholdsOf({ warn_at: 0, alert_at: 'x' })).toEqual({ warnAt: 50, alertAt: 60 })
+  expect(zoneOf(65, { warnAt: 40, alertAt: 70 })).toBe('warn')
+})
+
+test('set to 40–70%, 65% warns but offers nothing yet, and 72% does', { options: { warn_at: 40, alert_at: 70 } }, async ($, on) => {
+  const { turn } = await zoneSession($, on, [])
+  await turn(at(65))
+  let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /working zone/ })).toBeUndefined()
+  await ui.unmount()
+  await turn(at(72))
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /past the working zone \(40–70%\)/ })).toBeDefined()
   await ui.unmount()
 })

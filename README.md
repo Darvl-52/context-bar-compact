@@ -42,9 +42,20 @@ default. From a shell:
 echo '{"warn_at": 40, "alert_at": 70}' | claude plugin configure context-bar-compact --values-stdin
 ```
 
-`/context-bar` hides or shows the bar for the session. `/context-bar details` opens a pane with the
-full breakdown: each category, memory files, MCP servers and how many of their tools are loaded,
-the largest skills, custom agents and the cache split of the last API call.
+## Commands
+
+| Command                                 | What it does                                                                                                                                                                                                        |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/context-bar`                          | Hide or show the bar for this session.                                                                                                                                                                              |
+| `/context-bar details`                  | Open a pane with the full breakdown: each category, memory files, MCP servers and how many of their tools are loaded, the largest skills, custom agents and the cache split of the last API call. `r` refreshes it. |
+| `/plugin configure context-bar-compact` | Set the working zone: `warn_at` and `alert_at`.                                                                                                                                                                     |
+
+Keys on the warning row, once the band has the focus (a click, or ctrl+x tab):
+
+| Key | What it does                                                          |
+| --- | --------------------------------------------------------------------- |
+| `h` | Put `/mattpocock-skills:handoff ` in the prompt box (when installed). |
+| `c` | Put `/compact ` in the prompt box.                                    |
 
 It reads only the usage numbers Claude Code already has, the same ones `/context` shows, and sends
 nothing anywhere. The details pane costs a few extra requests, like running `/context`, so it

@@ -333,7 +333,11 @@ export const handoffTitle = (content: string, path: string) => {
 
 export const resumeText = (path: string, w: Words = EN) => w.resumeText(path)
 
-const wordsIn = async ($: EngineInterface) => WORDS[(await $.state.get(langState)).value ?? 'en']
+// The language and zone in force, kept by the module too: a /clear empties $.state and the module
+// lives on, so a read falls back here until the values are set again.
+const kept: { lang: Lang; zone: Thresholds } = { lang: 'en', zone: DEFAULT_THRESHOLDS }
+
+const wordsIn = async ($: EngineInterface) => WORDS[(await $.state.get(langState)).value ?? kept.lang]
 
 let lastFetch = 0
 let isFetching = false
@@ -370,7 +374,7 @@ async function refresh($: EngineInterface, force = false) {
     // Time first, so the new snapshot never draws against a stale clock.
     await $.state.set(now, at)
     await $.state.set(snapshot, next)
-    const zone = zoneOf(next.percent, (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS)
+    const zone = zoneOf(next.percent, (await $.state.get(zoneState)).value ?? kept.zone)
     if (zone === 'over' && !hasAlerted) {
       hasAlerted = true
       $.ui.toast((await wordsIn($)).toast(next.percent, handoff !== undefined))
@@ -446,6 +450,7 @@ async function openDetails($: EngineInterface) {
 
 async function setZone($: EngineInterface, t: Thresholds | 'reset') {
   const next = t === 'reset' ? DEFAULT_THRESHOLDS : t
+  kept.zone = next
   await $.state.set(zoneState, next)
   if (t === 'reset') await $.store.delete(ZONE_KEY)
   else await $.store.set(ZONE_KEY, next)
@@ -478,11 +483,21 @@ async function forgetHandoff($: EngineInterface, spent: Handoff) {
   await $.state.set(offer, null)
 }
 
+// What the session starts from, read again from the store: the language and the zone. Run at the
+// start and after a /clear, which empties $.state and fires no session.start.
+async function restore($: EngineInterface) {
+  const lang = await $.store.get(LANG_KEY).catch(() => undefined)
+  kept.lang = lang === 'ru' ? 'ru' : 'en'
+  await $.state.set(langState, kept.lang)
+  const saved = (await $.store.get(ZONE_KEY).catch(() => undefined)) as Partial<Thresholds> | undefined
+  kept.zone = saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS
+  await $.state.set(zoneState, kept.zone)
+}
+
 export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
-    const lang = await $.store.get(LANG_KEY).catch(() => undefined)
-    await $.state.set(langState, lang === 'ru' ? 'ru' : 'en')
+    await restore($)
     await $.command.register({
       name: 'context-bar',
       description: (await wordsIn($)).description,
@@ -496,8 +511,6 @@ export const register: Register = on => {
         void $.clock.now().then(at => $.state.set(now, at))
       })
     handoff = findHandoff(await $.command.list().catch(() => []))
-    const saved = (await $.store.get(ZONE_KEY).catch(() => undefined)) as Partial<Thresholds> | undefined
-    await $.state.set(zoneState, saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS)
     // Draw the bar as soon as the session opens; never let a failed read block startup.
     await refresh($, true).catch(() => {})
     const isReload = (await $.state.get(hasStarted)).value ?? false
@@ -507,18 +520,24 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A /clear starts no session.start: the conversation that follows is offered the handoff here.
-  on('session.end', async ($, e, next) => {
-    const ended = await next(e)
-    if (e.reason === 'clear') {
+  // A /clear (a /resume, a compaction) starts no session.start, and a /clear or /resume empties
+  // $.state: what the session started from is read again, and after a /clear the conversation
+  // that follows is offered the handoff just written.
+  on('classic.SessionStart', async ($, e, next) => {
+    const ran = await next(e)
+    if (e.source === 'startup') return ran
+    await restore($)
+    await $.state.set(hasStarted, true)
+    if (e.source === 'clear') {
       // A new conversation: no pace yet, and no cache of its own to lose.
       await $.state.set(paceState, null)
       await $.state.set(repliedAt, 0)
       const root = await $.session.root().catch(() => undefined)
       if (root !== undefined) await offerHandoff($, root).catch(() => {})
     }
-    return ended
-  })
+    await refresh($, true).catch(() => {})
+    return ran
+  }).catch(($, e, next) => next(e))
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command && /(^|:)handoff$/.test(e.command.name)) isHandingOff = true
@@ -558,11 +577,12 @@ export const register: Register = on => {
         return { text: w.zoneOpened }
       }
       await setZone($, asked)
-      return { text: w.zoneSet((await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS) }
+      return { text: w.zoneSet((await $.state.get(zoneState)).value ?? kept.zone) }
     }
     if (verb.toLowerCase() === 'lang') {
       const asked = rest[0]?.toLowerCase()
       if (asked !== 'en' && asked !== 'ru') return { text: w.langUsage }
+      kept.lang = asked
       await $.state.set(langState, asked)
       await $.store.set(LANG_KEY, asked)
       // The breakdown's notes are worded when read: read it again in the new language.
@@ -628,7 +648,7 @@ export const register: Register = on => {
         </Box>
       )
 
-    const thresholds = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
+    const thresholds = (await $.state.get(zoneState)).value ?? kept.zone
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
     const pace = (await $.state.get(paceState)).value ?? null
@@ -731,7 +751,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: ZONE_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const w = await wordsIn($)
-    const t = (await $.state.get(zoneState)).value ?? DEFAULT_THRESHOLDS
+    const t = (await $.state.get(zoneState)).value ?? kept.zone
     const snap = (await $.state.get(snapshot)).value ?? null
     const step = (which: keyof Thresholds, label: string, color: string) => (
       <Box flexDirection="row" gap={1}>

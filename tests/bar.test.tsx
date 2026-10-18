@@ -482,15 +482,21 @@ const handoffSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBod
       : { deny: 'unexpected' },
   )
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('classic.SessionStart', () => ({}))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  // A /clear: the session ends, and the next one starts with no session.start of its own.
+  const clear = async () => {
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as Parameters<typeof $.session.end>[0])
+    await $.classic.SessionStart({ source: 'clear' })
+  }
   const send = (text: string, command?: { name: string; args: string }) =>
     $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false, ...(command ? { command } : {}) })
-  return { fills, suggestions, store, clock, send }
+  return { fills, suggestions, store, clock, send, clear }
 }
 
 test('after /clear the handoff just written is offered: a row, a suggestion, resume fills it in', async ($, on) => {
-  const { fills, suggestions, store, clock, send } = await handoffSession($, on)
+  const { fills, suggestions, store, clock, send, clear } = await handoffSession($, on)
   let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
   expect(await ui.find({ type: 'Text', text: /handoff/ })).toBeUndefined()
   await ui.unmount()
@@ -502,7 +508,7 @@ test('after /clear the handoff just written is offered: a row, a suggestion, res
   // Filed under the project root, where the next session starts, not where the shell had wandered.
   expect(Object.keys(store.get('handoffs') as object)).toEqual(['/proj'])
   await clock.advance(5 * 60_000)
-  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as Parameters<typeof $.session.end>[0])
+  await clear()
   await clock.advance(1_000)
   expect(suggestions).toEqual([resumeText(NOTES)])
 
@@ -519,6 +525,17 @@ test('after /clear the handoff just written is offered: a row, a suggestion, res
   expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
   await ui.unmount()
   expect(store.get('handoffs')).toEqual({})
+})
+
+test('after /clear the language is read again from the store', async ($, on) => {
+  const { store, clear } = await handoffSession($, on)
+  const run = (args: string) =>
+    $.command.run({ command: 'context-bar', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+  expect((await run('lang de')).text).toMatch(/^Usage:/)
+  // Set by another session meanwhile; a /clear reads what the store holds now.
+  store.set('lang', 'ru')
+  await clear()
+  expect((await run('lang de')).text).toMatch(/^Как вызвать:/)
 })
 
 test('a new session in the folder is offered its handoff; another folder, a stale one or a dismissed one is not', async ($, on) => {

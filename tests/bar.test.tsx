@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { ContextCategory, SessionUsage } from 'claude-code'
 import type { TestBody } from 'claude-code/testing'
 
-import { allocate, findHandoff, limitColor, nudge, parseZone, thresholdsOf, zoneOf } from '../hooks/register'
+import { allocate, findHandoff, handoffTitle, isHandoffFile, limitColor, nudge, resumeText, parseZone, thresholdsOf, zoneOf } from '../hooks/register'
 
 const row = (name: string, tokens: number, color: string, kind: ContextCategory['kind']): ContextCategory => ({
   name,
@@ -414,4 +414,123 @@ test('the band is shared: what is drawn beneath stays under the bar', async ($, 
   expect(await ui.find({ type: 'Text', text: /30%/ })).toBeDefined()
   expect(await ui.find({ key: 'engine' })).toBeDefined()
   await ui.unmount()
+})
+
+test('a handoff file is a Markdown file the handoff skill writes, or one named so in a temp dir', () => {
+  expect(isHandoffFile('/var/folders/4f/x/T/handoff-claude-mods.md', false)).toBe(true)
+  expect(isHandoffFile('C:\\Users\\me\\AppData\\Local\\Temp\\Handoff.md', false)).toBe(true)
+  expect(isHandoffFile('/var/folders/4f/x/T/notes-for-next.md', false)).toBe(false)
+  expect(isHandoffFile('/var/folders/4f/x/T/notes-for-next.md', true)).toBe(true)
+  expect(isHandoffFile('/proj/docs/handoff.md', false)).toBe(false)
+  expect(isHandoffFile('/tmp/handoff.txt', true)).toBe(false)
+  expect(handoffTitle('Intro\n# Handoff: моды Claude Code\n\n## Next', '/tmp/a.md')).toBe('моды Claude Code')
+  expect(handoffTitle('no heading', '/tmp/pyrus-handoff.md')).toBe('pyrus-handoff')
+})
+
+const PATH = '/var/folders/4f/x/T/handoff-claude-mods.md'
+const handoffSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], stored: Record<string, unknown> = {}) => {
+  const fills: string[] = []
+  const suggestions: string[] = []
+  // The plugin's store, kept here so a test reads what it wrote.
+  const store = new Map(Object.entries(stored))
+  on('store.get', ($, e) => ({ value: store.get(e.key) }))
+  on('store.set', ($, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  const clock = mock.clock(on, { now: 10 * HOUR })
+  on('session.usage', () => ({ value: USAGE }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  // The shell has wandered into a subfolder; the project root stays where the session began.
+  on('session.cwd', () => ({ value: '/proj/sub' }))
+  on('session.root', () => ({ value: '/proj' }))
+  on('fs.exists', () => ({ value: true }))
+  on('prompt.fill', ($, e) => {
+    fills.push(e.text)
+    return { isFilled: true }
+  })
+  on('prompt.suggest', ($, e) => {
+    suggestions.push(e.text)
+    return { isShown: true }
+  })
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('tool.call', ($, e) =>
+    e.tool === 'Write'
+      ? { result: { type: 'create' as const, filePath: e.file_path, content: e.content, structuredPatch: [], originalFile: null } }
+      : { deny: 'unexpected' },
+  )
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const send = (text: string, command?: { name: string; args: string }) =>
+    $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false, ...(command ? { command } : {}) })
+  return { fills, suggestions, store, clock, send }
+}
+
+test('after /clear the handoff just written is offered: a row, a suggestion, resume fills it in', async ($, on) => {
+  const { fills, suggestions, store, clock, send } = await handoffSession($, on)
+  let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /handoff/ })).toBeUndefined()
+  await ui.unmount()
+
+  // The skill names its file as it likes: what /handoff writes is the handoff.
+  const NOTES = '/var/folders/4f/x/T/claude-mods-next.md'
+  await send('/mattpocock-skills:handoff моды', { name: 'mattpocock-skills:handoff', args: 'моды' })
+  await $.tool.call({ tool: 'Write', file_path: NOTES, content: '# Handoff: моды Claude Code\n' })
+  // Filed under the project root, where the next session starts, not where the shell had wandered.
+  expect(Object.keys(store.get('handoffs') as object)).toEqual(['/proj'])
+  await clock.advance(5 * 60_000)
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as Parameters<typeof $.session.end>[0])
+  await clock.advance(1_000)
+  expect(suggestions).toEqual([resumeText(NOTES)])
+
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^↩ handoff 5m ago: моды Claude Code$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /30% 60k\/200k/ })).toBeDefined()
+  await ui.press({ key: 'resume' })
+  expect(fills).toEqual([resumeText(NOTES)])
+  await ui.unmount()
+
+  // Sent, it is spent: gone from the band and from the store.
+  await send(resumeText(NOTES))
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
+  await ui.unmount()
+  expect(store.get('handoffs')).toEqual({})
+})
+
+test('a new session in the folder is offered its handoff; another folder, a stale one or a dismissed one is not', async ($, on) => {
+  const h = { path: PATH, cwd: '/proj', at: 10 * HOUR - 2 * HOUR, title: 'моды' }
+  const { store } = await handoffSession($, on, { handoffs: { '/proj': h, '/old': { ...h, cwd: '/old', at: 10 * HOUR - 25 * HOUR } } })
+  let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^↩ handoff 2h0m ago: моды$/ })).toBeDefined()
+  await ui.press({ key: 'dismiss' })
+  expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
+  await ui.unmount()
+  expect(Object.keys(store.get('handoffs') as object)).toEqual(['/old'])
+
+  await $.session.start({ cwd: '/old', surface: 'terminal', isInteractive: true })
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the handoff row shows with the bar off, and any other prompt puts it away', async ($, on) => {
+  const h = { path: PATH, cwd: '/proj', at: 10 * HOUR, title: 'моды' }
+  const { store, send } = await handoffSession($, on, { handoffs: { '/proj': h } })
+  await $.command.run({ command: 'context-bar', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^↩ handoff just now: моды$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /60k\/200k/ })).toBeUndefined()
+  await ui.unmount()
+
+  await send('something else')
+  ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
+  await ui.unmount()
+  expect(store.get('handoffs')).toEqual({ '/proj': h })
 })

@@ -28,8 +28,11 @@ export type Details = {
 // The working zone: from `warnAt` % of the window the figure turns yellow, from `alertAt` red.
 export type Thresholds = { warnAt: number; alertAt: number }
 
+// A handoff document written in a session, offered to the next one in the same folder.
+export type Handoff = { path: string; cwd: string; at: number; title: string }
+
 declare module 'claude-code' {
   interface PluginState {
-    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds }
+    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds; handoff: Handoff | null }
   }
 }

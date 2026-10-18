@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { Details, Limit, Row, Segment, Snapshot, Thresholds } from '../types'
+import type { Details, Handoff, Limit, Row, Segment, Snapshot, Thresholds } from '../types'
 
 // On at the start of every session; /context-bar hides it for that session only.
 const isOn = atom({ plugin: 'context-bar-compact', key: 'isOn' } as const, true)
@@ -12,11 +12,17 @@ const details = atom({ plugin: 'context-bar-compact', key: 'details' } as const,
 const isDetailsOpen = atom({ plugin: 'context-bar-compact', key: 'isDetailsOpen' } as const, false)
 // The working zone in force: what /context-bar zone saved, else the defaults.
 const zoneAtom = atom({ plugin: 'context-bar-compact', key: 'zone' } as const, { warnAt: 50, alertAt: 60 })
+// The handoff offered above the prompt, until it is taken up, dismissed or another prompt is sent.
+const offer = atom({ plugin: 'context-bar-compact', key: 'handoff' } as const, null)
 
 const PANE = 'context-details'
 const ZONE_PANE = 'context-zone'
 const ZONE_KEY = 'zone'
 const ZONE_STEP = 5
+// The latest handoff per folder, kept in the store so a new process finds it too.
+const HANDOFFS_KEY = 'handoffs'
+// A handoff older than this is no longer offered.
+const HANDOFF_MAX_AGE_MS = 24 * 3_600_000
 export const PRESETS: readonly Thresholds[] = [
   { warnAt: 40, alertAt: 50 },
   { warnAt: 50, alertAt: 60 },
@@ -143,6 +149,20 @@ const tail = (path: string) => {
 
 const byTokens = (a: Row, b: Row) => b.tokens - a.tokens
 
+// The handoff skill names its file freely; a Markdown file written while it runs, or one in a
+// temporary directory with `handoff` in its name, is taken for one.
+export const isHandoffFile = (path: string, isRunning: boolean) =>
+  /\.md$/i.test(path) && (isRunning || (/handoff/i.test(path.split(/[\\/]/).pop() ?? '') && /([\\/](T|tmp|Temp)[\\/])/i.test(path)))
+
+// The document's first heading, without a leading `Handoff:`; else the file's name.
+export const handoffTitle = (content: string, path: string) => {
+  const heading = /^#\s+(.+)$/m.exec(content)?.[1]?.trim()
+  const title = heading?.replace(/^handoff\s*[:—–-]\s*/i, '').trim()
+  return title || (path.split(/[\\/]/).pop() ?? path).replace(/\.md$/i, '')
+}
+
+export const resumeText = (path: string) => `Read ${path} and pick up from there.`
+
 let lastFetch = 0
 let isFetching = false
 let isFetchingDetails = false
@@ -150,6 +170,8 @@ let tick: { cancel: () => void } | undefined
 let handoff: string | undefined
 // Raised once past the zone; lowered when the window drops back under its start, after a compact.
 let hasAlerted = false
+// True from a /handoff until its turn completes: the Markdown file written meanwhile is the handoff.
+let isHandingOff = false
 
 async function refresh($: EngineInterface, force = false) {
   const at = await $.clock.now()
@@ -249,6 +271,28 @@ async function setZone($: EngineInterface, t: Thresholds | 'reset') {
   hasAlerted = false
 }
 
+const savedHandoffs = async ($: EngineInterface) =>
+  ((await $.store.get(HANDOFFS_KEY).catch(() => undefined)) as Record<string, Handoff> | undefined) ?? {}
+
+// What a fresh start in this folder is offered: its latest handoff, if recent and still on disk.
+// The prompt box shows the request to read it as its dim suggestion, Tab to take.
+async function offerHandoff($: EngineInterface, cwd: string) {
+  const saved = (await savedHandoffs($))[cwd]
+  const at = await $.clock.now()
+  const isLive = saved !== undefined && at - saved.at < HANDOFF_MAX_AGE_MS && (await $.fs.exists(saved.path).catch(() => false))
+  await update($, offer, () => (isLive ? saved : null))
+  if (isLive) void $.clock.sleep(300).then(() => $.prompt.suggest({ text: resumeText(saved.path) })).catch(() => {})
+}
+
+async function forgetHandoff($: EngineInterface, spent: Handoff) {
+  const all = await savedHandoffs($)
+  if (all[spent.cwd]?.path === spent.path) {
+    delete all[spent.cwd]
+    await $.store.set(HANDOFFS_KEY, all)
+  }
+  await update($, offer, () => null)
+}
+
 export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
@@ -269,8 +313,39 @@ export const register: Register = on => {
     await update($, zoneAtom, () => (saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS))
     // Draw the bar as soon as the session opens; never let a failed read block startup.
     await refresh($, true).catch(() => {})
+    if (e.isInteractive) await offerHandoff($, e.cwd).catch(() => {})
     return next(e)
   })
+
+  // A /clear starts no session.start: the conversation that follows is offered the handoff here.
+  on('session.end', async ($, e, next) => {
+    const ended = await next(e)
+    if (e.reason === 'clear') await offerHandoff($, await $.session.root()).catch(() => {})
+    return ended
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    if (e.command && /(^|:)handoff$/.test(e.command.name)) isHandingOff = true
+    const waiting = await read($, offer)
+    // Taken up, it is spent; any other prompt only puts it away for this conversation.
+    if (waiting && !e.isMeta) {
+      if (e.text.includes(waiting.path)) await forgetHandoff($, waiting)
+      else await update($, offer, () => null)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny === undefined && !ran.isError && isHandoffFile(e.file_path, isHandingOff)) {
+      // The project root, not the shell's directory: a `cd` during the session would file the
+      // handoff under a folder the next session never starts in.
+      const cwd = await $.session.root()
+      const written: Handoff = { path: e.file_path, cwd, at: await $.clock.now(), title: handoffTitle(e.content, e.file_path) }
+      await $.store.set(HANDOFFS_KEY, { ...(await savedHandoffs($)), [cwd]: written })
+    }
+    return ran
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'context-bar' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
@@ -306,18 +381,45 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    isHandingOff = false
     void refresh($, true)
     if (await read($, isDetailsOpen)) void refreshDetails($).catch(() => {})
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || !(await read($, isOn))) return next(e)
-    const snap = await read($, snapshot)
-    if (!snap || snap.segments.length === 0) return next(e)
+    if (e.props.hasSurvey) return next(e)
+    const waiting = await read($, offer)
+    const snap = (await read($, isOn)) ? await read($, snapshot) : null
+    const hasBar = snap !== null && snap.segments.length > 0
+    if (!hasBar && !waiting) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const at = await read($, now)
+    // The buttons put the command in the prompt box rather than run it: a handoff wants to be
+    // told what the next session is for, and either can still be thought better of.
+    const fill = (text: string) => void $.prompt.fill({ text }).catch(() => {})
+    // A handoff left by an earlier conversation in this folder, to pick up from; shown whether
+    // or not the bar is on.
+    const resume = waiting ? (
+      <Box flexDirection="row" gap={1}>
+        <Box flexShrink={1}>
+          <Text wrap="truncate" color="suggestion" bold>
+            ↩ handoff {at - waiting.at < 60_000 ? 'just now' : `${span(at - waiting.at)} ago`}: {waiting.title}
+          </Text>
+        </Box>
+        <Button key="resume" label="resume" hotkey="r" plain onPress={() => fill(resumeText(waiting.path))} />
+        <Button key="dismiss" label="dismiss" hotkey="x" plain dimColor onPress={() => void forgetHandoff($, waiting)} />
+      </Box>
+    ) : null
+    if (!hasBar)
+      return (
+        <Box flexDirection="column">
+          {resume}
+          {await next(e)}
+        </Box>
+      )
+
     const thresholds = await read($, zoneAtom)
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
@@ -332,10 +434,6 @@ export const register: Register = on => {
     const width = isShort ? Math.max(8, Math.min(BAR_CELLS, roomFor(true))) : BAR_CELLS
     const cells = allocate(snap.segments, snap.max, width)
     const limits = limitParts(snap.limits, at, isShort)
-    // The buttons put the command in the prompt box rather than run it: a handoff wants to be
-    // told what the next session is for, and either can still be thought better of.
-    const fill = (text: string) => void $.prompt.fill({ text }).catch(() => {})
-
     const left = (
       <Text wrap="truncate">
         {snap.segments.map((s, i) =>
@@ -378,6 +476,7 @@ export const register: Register = on => {
       return (
         <Box flexDirection="column">
           {bar}
+          {resume}
           {below}
         </Box>
       )
@@ -391,6 +490,7 @@ export const register: Register = on => {
           {handoff ? <Button key="handoff" label="handoff" hotkey="h" plain onPress={() => fill(`/${handoff} `)} /> : null}
           <Button key="compact" label="/compact" hotkey="c" plain onPress={() => fill('/compact ')} />
         </Box>
+        {resume}
         {below}
       </Box>
     )

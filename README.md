@@ -52,6 +52,23 @@ it writes the conversation to a file in your temp directory that a fresh session
 up. Neither runs until you press Enter. The toast comes back only after the window has dropped
 under 50% again, say after a compact.
 
+### Picking up a handoff
+
+When a handoff is written, the bar remembers it for the folder you are in. After `/clear`, or in
+the next session started in that folder within a day, a row under the bar offers it:
+
+```
+↩ handoff 5m ago: Claude Code mods  r: resume  x: dismiss
+```
+
+and the empty prompt box shows `Read <file> and pick up from there.` as its dim suggestion: `Tab`
+takes it, `Enter` sends it. `r` puts the same request in the box, `x` forgets the handoff. Once
+sent, it is not offered again; any other prompt just puts the row away for that conversation. The
+row shows even with the bar turned off.
+
+A handoff is the Markdown file written while `/handoff` runs, or one with `handoff` in its name in
+your temp directory.
+
 Set the zone with `/context-bar zone`: a pane with − and + for each threshold (5% a step),
 presets on `1`–`4` (40–50, 50–60, 60–70, 70–80), `r` to go back to 50–60, and your current share
 shown in the colour it would take. Every change shows on the bar at once and is kept for every
@@ -67,12 +84,14 @@ session. Without the pane, `/context-bar zone 40 70` sets yellow from 40% and re
 | `/context-bar zone 40 70` | Yellow from 40%, red from 70%, without the pane.                                                                                                                                                                    |
 | `/context-bar zone reset` | Back to 50–60.                                                                                                                                                                                                      |
 
-Keys on the warning row, once the band has the focus (a click, or ctrl+x tab):
+Keys on the warning and handoff rows, once the band has the focus (a click, or ctrl+x tab):
 
 | Key | What it does                                                          |
 | --- | --------------------------------------------------------------------- |
 | `h` | Put `/mattpocock-skills:handoff ` in the prompt box (when installed). |
 | `c` | Put `/compact ` in the prompt box.                                    |
+| `r` | Put the request to read the offered handoff in the prompt box.        |
+| `x` | Dismiss the offered handoff.                                          |
 
 It reads only the usage numbers Claude Code already has, the same ones `/context` shows, and sends
 nothing anywhere. The details pane costs a few extra requests, like running `/context`, so it

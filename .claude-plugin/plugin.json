@@ -1,0 +1,10 @@
+{
+  "name": "context-bar-compact",
+  "version": "0.1.0",
+  "description": "One-line context bar above the prompt: usage by /context category, 5h/7d limits and room before compaction; /context-bar details for a full breakdown. Compact fork of akash001uts/context-bar (MIT).",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Darvl-52"
+  },
+  "repository": "https://github.com/Darvl-52/context-bar-compact"
+}

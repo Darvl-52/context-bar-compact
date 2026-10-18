@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { ContextCategory, SessionUsage } from 'claude-code'
+import type { TestBody } from 'claude-code/testing'
 
-import { allocate } from '../hooks/register'
+import { allocate, findHandoff, zoneOf } from '../hooks/register'
 
 const row = (name: string, tokens: number, color: string, kind: ContextCategory['kind']): ContextCategory => ({
   name,
@@ -208,4 +209,103 @@ test('/context-bar details opens the breakdown pane without toggling the bar', a
 
   // The bar is still on: the next plain toggle turns it off.
   expect((await run('')).text).toBe('Context bar off.')
+})
+
+// The same window at a given fill, for the working-zone tests.
+const at = (percent: number): SessionUsage => ({
+  ...USAGE,
+  context: {
+    ...USAGE.context,
+    percent,
+    breakdown: { ...USAGE.context.breakdown!, percentage: percent, totalTokens: percent * 2_000 },
+  },
+})
+
+test('the working zone: plain under 50%, a warning from 50%, past it from 60%', () => {
+  expect([49, 50, 59, 60, 95].map(zoneOf)).toEqual(['ok', 'warn', 'warn', 'over', 'over'])
+})
+
+test('the handoff command is found by name, Matt Pocock\'s first', () => {
+  expect(findHandoff([{ name: 'review' }, { name: 'mattpocock-skills:handoff', plugin: 'mattpocock-skills' }])).toBe('mattpocock-skills:handoff')
+  expect(findHandoff([{ name: 'other:handoff', plugin: 'other' }, { name: 'mattpocock-skills:handoff', plugin: 'mattpocock-skills' }])).toBe(
+    'mattpocock-skills:handoff',
+  )
+  expect(findHandoff([{ name: 'handoff' }])).toBe('handoff')
+  expect(findHandoff([{ name: 'handoffs' }, { name: 'compact' }])).toBeUndefined()
+})
+
+const zoneSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], commands: { name: string; plugin?: string }[]) => {
+  let usage = at(62)
+  const toasts: string[] = []
+  const fills: string[] = []
+  const clock = mock.clock(on)
+  on('session.usage', () => ({ value: usage }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.list', () => ({ value: commands.map(c => ({ ...c, description: '', source: 'plugin' as const })) }))
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('prompt.fill', ($, e) => {
+    fills.push(e.text)
+    return { isFilled: true }
+  })
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
+  // A fresh read, as after a turn: /context-bar off and on again forces one.
+  const toggle = () =>
+    $.command.run({ command: 'context-bar', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const turn = async (next: SessionUsage) => {
+    usage = next
+    await toggle()
+    await toggle()
+    await clock.advance(10)
+  }
+  return { toasts, fills, turn }
+}
+
+test('past 60% the band offers a handoff and /compact, and a toast says so once', async ($, on) => {
+  const { toasts, fills, turn } = await zoneSession($, on, [{ name: 'mattpocock-skills:handoff', plugin: 'mattpocock-skills' }])
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /past the working zone \(50–60%\)/ })).toBeDefined()
+  await ui.press({ key: 'handoff' })
+  await ui.press({ key: 'compact' })
+  expect(fills).toEqual(['/mattpocock-skills:handoff ', '/compact '])
+  await ui.unmount()
+
+  // Still past it: no second toast. Back under 50% after a compact, then past again: one more.
+  await turn(at(70))
+  await turn(at(20))
+  await turn(at(65))
+  expect(toasts).toHaveLength(2)
+  expect(toasts[0]).toMatch(/^Context 62%: past the working zone\. Handoff or \/compact/)
+})
+
+test('without the handoff skill only /compact is offered', async ($, on) => {
+  await zoneSession($, on, [])
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ key: 'handoff' })).toBeUndefined()
+  expect(await ui.find({ key: 'compact' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('under 60% there is no warning row', async ($, on) => {
+  mock.clock(on)
+  on('session.usage', () => ({ value: at(55) }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.list', () => ({ value: [] }))
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: 'C:/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /55%/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /working zone/ })).toBeUndefined()
+  await ui.unmount()
 })

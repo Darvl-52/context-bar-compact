@@ -17,6 +17,19 @@ const BAR_CELLS = 20
 const REFRESH_MS = 3000
 const TICK_MS = 60_000
 const LIMIT_LABEL: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }
+// The working zone of the window: past WARN_AT the figure turns yellow, past ALERT_AT red,
+// with a toast once and a row offering a handoff or /compact.
+export const WARN_AT = 50
+export const ALERT_AT = 60
+
+export type Zone = 'ok' | 'warn' | 'over'
+export const zoneOf = (percent: number): Zone => (percent >= ALERT_AT ? 'over' : percent >= WARN_AT ? 'warn' : 'ok')
+const ZONE_COLOR: Record<Zone, string | undefined> = { ok: undefined, warn: 'warning', over: 'error' }
+
+// Matt Pocock's handoff skill, when its plugin is installed: the command's name as typed.
+export const findHandoff = (commands: readonly { name: string; plugin?: string }[]) =>
+  commands.find(c => c.plugin === 'mattpocock-skills' && /(^|:)handoff$/.test(c.name))?.name ??
+  commands.find(c => /(^|:)handoff$/.test(c.name))?.name
 
 export const short = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
@@ -80,6 +93,9 @@ let lastFetch = 0
 let isFetching = false
 let isFetchingDetails = false
 let tick: { cancel: () => void } | undefined
+let handoff: string | undefined
+// Raised once past ALERT_AT; lowered when the window drops back under WARN_AT, after a compact.
+let hasAlerted = false
 
 async function refresh($: EngineInterface, force = false) {
   const at = await $.clock.now()
@@ -106,6 +122,11 @@ async function refresh($: EngineInterface, force = false) {
     // Time first, so the new snapshot never draws against a stale clock.
     await update($, now, () => at)
     await update($, snapshot, () => next)
+    const zone = zoneOf(next.percent)
+    if (zone === 'over' && !hasAlerted) {
+      hasAlerted = true
+      $.ui.toast(`Context ${next.percent}%: past the working zone. ${handoff ? 'Handoff or /compact' : '/compact'} from the row above the prompt.`)
+    } else if (zone === 'ok') hasAlerted = false
   } finally {
     isFetching = false
   }
@@ -178,6 +199,7 @@ export const register: Register = on => {
       tick = $.clock.every(TICK_MS, () => {
         void $.clock.now().then(at => update($, now, () => at))
       })
+    handoff = findHandoff(await $.command.list().catch(() => []))
     // Draw the bar as soon as the session opens; never let a failed read block startup.
     await refresh($, true).catch(() => {})
     return next(e)
@@ -215,14 +237,19 @@ export const register: Register = on => {
     const snap = await read($, snapshot)
     if (!snap || snap.segments.length === 0) return next(e)
 
-    const { Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const info = infoLine(snap, await read($, now))
-    const summary = ` ${snap.percent}% ${tiny(snap.total)}/${tiny(snap.max)}${info ? ` · ${info}` : ''}`
+    const zone = zoneOf(snap.percent)
+    const figure = ` ${snap.percent}%`
+    const summary = ` ${tiny(snap.total)}/${tiny(snap.max)}${info ? ` · ${info}` : ''}`
     // A short bar, narrower still when the summary would not fit beside it.
-    const width = Math.max(8, Math.min(BAR_CELLS, e.props.bodyColumns - summary.length))
+    const width = Math.max(8, Math.min(BAR_CELLS, e.props.bodyColumns - figure.length - summary.length))
     const cells = allocate(snap.segments, snap.max, width)
+    // The buttons put the command in the prompt box rather than run it: a handoff wants to be
+    // told what the next session is for, and either can still be thought better of.
+    const fill = (text: string) => void $.prompt.fill({ text }).catch(() => {})
 
-    return (
+    const bar = (
       <Text wrap="truncate">
         {snap.segments.map((s, i) =>
           cells[i]! > 0 ? (
@@ -231,8 +258,22 @@ export const register: Register = on => {
             </Text>
           ) : null,
         )}
+        <Text color={ZONE_COLOR[zone]} dimColor={zone === 'ok'} bold={zone === 'over'}>
+          {figure}
+        </Text>
         <Text dimColor>{summary}</Text>
       </Text>
+    )
+    if (zone !== 'over' || e.props.maxRows < 2) return bar
+    return (
+      <Box flexDirection="column">
+        {bar}
+        <Box flexDirection="row" gap={1}>
+          <Text color="error">⚠ past the working zone ({WARN_AT}–{ALERT_AT}%)</Text>
+          {handoff ? <Button key="handoff" label="handoff" hotkey="h" plain onPress={() => fill(`/${handoff} `)} /> : null}
+          <Button key="compact" label="/compact" hotkey="c" plain onPress={() => fill('/compact ')} />
+        </Box>
+      </Box>
     )
   })
 

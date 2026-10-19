@@ -26,11 +26,13 @@ the left and your account's rate limits on the right.
   from 75%, red from 90%.
 - `resets in 2h14m` when that limit starts over, counted down each minute.
 
-On a narrow terminal the limits shorten first, then the bar shrinks, then the end of the line is
-cut:
+On a narrow terminal the limits shorten first, then the bar shrinks, then the line gives up, a step
+at a time, the turns left, `compacts in`, and the limits; only past that is its end cut:
 
 ```
 ██████░░░░░░░░░░░▒▒▒ 30% 60k/200k · compacts in 100k      5h 42% ↻2h14m · 7d 18%
+██████░░░░░░░░░░░▒▒▒ 30% 60k/200k   5h 42% ↻2h14m · 7d 18%
+██████░░░░░░░░░░░▒▒▒ 30% 60k/200k
 ```
 
 Other mods that draw rows above the prompt keep them, under this line.

@@ -1,5 +1,6 @@
 {
   "name": "context-bar-compact",
   "owner": { "name": "Darvl-52" },
+  "description": "context-bar-compact: one line above the Claude Code prompt with the context window, room before compaction and the account's rate limits.",
   "plugins": [{ "name": "context-bar-compact", "source": "./" }]
 }

@@ -10,10 +10,13 @@ import {
   handoffTitle,
   isHandoffFile,
   largest,
+  layoutOf,
   limitColor,
+  mentionsPath,
   nextPace,
   span,
   nudge,
+  pathKey,
   resumeText,
   parseZone,
   thresholdsOf,
@@ -446,7 +449,14 @@ test('a handoff file is a Markdown file the handoff skill writes, or one named s
 })
 
 const PATH = '/var/folders/4f/x/T/handoff-claude-mods.md'
-const handoffSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], stored: Record<string, unknown> = {}) => {
+// `isManaged`: Claude Code under an organization's management, where the classic SessionStart hook
+// of an installed plugin never runs.
+const handoffSession = async (
+  $: Parameters<TestBody>[0],
+  on: Parameters<TestBody>[1],
+  stored: Record<string, unknown> = {},
+  { root = '/proj', isManaged = false }: { root?: string; isManaged?: boolean } = {},
+) => {
   const fills: string[] = []
   const suggestions: string[] = []
   // The plugin's store, kept here so a test reads what it wrote.
@@ -464,8 +474,9 @@ const handoffSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBod
   })
   on('command.register', () => ({ value: { command: 'context-bar' } }))
   // The shell has wandered into a subfolder; the project root stays where the session began.
-  on('session.cwd', () => ({ value: '/proj/sub' }))
-  on('session.root', () => ({ value: '/proj' }))
+  const where = { root }
+  on('session.cwd', () => ({ value: `${where.root}/sub` }))
+  on('session.root', () => ({ value: where.root }))
   on('fs.exists', () => ({ value: true }))
   on('prompt.fill', ($, e) => {
     fills.push(e.text)
@@ -484,15 +495,15 @@ const handoffSession = async ($: Parameters<TestBody>[0], on: Parameters<TestBod
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('classic.SessionStart', () => ({}))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: root, surface: 'terminal', isInteractive: true })
   // A /clear: the session ends, and the next one starts with no session.start of its own.
   const clear = async () => {
     await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as Parameters<typeof $.session.end>[0])
-    await $.classic.SessionStart({ source: 'clear' })
+    if (!isManaged) await $.classic.SessionStart({ source: 'clear' })
   }
   const send = (text: string, command?: { name: string; args: string }) =>
     $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false, ...(command ? { command } : {}) })
-  return { fills, suggestions, store, clock, send, clear }
+  return { fills, suggestions, store, clock, send, clear, where }
 }
 
 test('after /clear the handoff just written is offered: a row, a suggestion, resume fills it in', async ($, on) => {
@@ -586,6 +597,153 @@ test('the handoff row shows with the bar off, and any other prompt puts it away'
   expect(await ui.find({ type: 'Text', text: /↩ handoff/ })).toBeUndefined()
   await ui.unmount()
   expect(store.get('handoffs')).toEqual({ '/proj': h })
+})
+
+test('a path is one key whatever its slashes, and a Windows path whatever its case', () => {
+  expect(pathKey('D:\\Projects\\mods')).toBe('d:/projects/mods')
+  expect(pathKey('d:/Projects/mods/')).toBe('d:/projects/mods')
+  expect(pathKey('\\\\server\\share\\proj')).toBe(pathKey('\\\\SERVER\\share/proj'))
+  expect(pathKey('/Users/me/Proj')).toBe('/Users/me/Proj')
+  expect(pathKey('/Users/me/Proj/')).toBe('/Users/me/Proj')
+  expect(pathKey('/')).toBe('/')
+  // POSIX is case-sensitive: another case is another folder.
+  expect(pathKey('/users/me/proj')).not.toBe(pathKey('/Users/me/Proj'))
+
+  const win = 'C:\\Users\\Me\\AppData\\Local\\Temp\\handoff-mods.md'
+  expect(mentionsPath(`Read ${win} and pick up from there.`, win)).toBe(true)
+  expect(mentionsPath('Read c:/users/me/appdata/local/temp/handoff-mods.md please', win)).toBe(true)
+  expect(mentionsPath('Read C:\\Users\\Me\\other.md', win)).toBe(false)
+  expect(mentionsPath(`Read ${PATH} and pick up from there.`, PATH)).toBe(true)
+  expect(mentionsPath(`Read ${PATH.toUpperCase()}`, PATH)).toBe(false)
+  // A handoff written with Windows line ends reads the same.
+  expect(handoffTitle('Intro\r\n# Handoff: mods\r\n\r\n## Next\r\n', win)).toBe('mods')
+})
+
+test('a Windows folder finds its handoff after /clear however the path is spelled, and a reply naming it spends it', async ($, on) => {
+  const { suggestions, store, clock, send, clear, where } = await handoffSession($, on, {}, { root: 'D:\\Projects\\Mods' })
+  const NOTES = 'C:\\Users\\me\\AppData\\Local\\Temp\\handoff-mods.md'
+  await $.tool.call({ tool: 'Write', file_path: NOTES, content: '# Handoff: mods\r\n' })
+  expect(Object.keys(store.get('handoffs') as object)).toEqual(['d:/projects/mods'])
+  // The engine spells the same folder another way after the /clear.
+  where.root = 'd:/projects/mods'
+  await clear()
+  await clock.advance(1_000)
+  expect(suggestions).toEqual([resumeText(NOTES)])
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^↩ handoff just now: mods$/ })).toBeDefined()
+  await ui.unmount()
+  await send('Read c:/users/me/appdata/local/temp/handoff-mods.md and pick up from there.')
+  expect(store.get('handoffs')).toEqual({})
+})
+
+test('where an organization manages Claude Code, /clear still offers the handoff and reads the language again', async ($, on) => {
+  const { suggestions, store, clock, send, clear } = await handoffSession($, on, {}, { isManaged: true })
+  const run = (args: string) =>
+    $.command.run({ command: 'context-bar', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+  const NOTES = '/var/folders/4f/x/T/claude-mods-next.md'
+  await send('/mattpocock-skills:handoff моды', { name: 'mattpocock-skills:handoff', args: 'моды' })
+  await $.tool.call({ tool: 'Write', file_path: NOTES, content: '# Handoff: моды\n' })
+  store.set('lang', 'ru')
+  await clear()
+  await clock.advance(1_000)
+  expect(suggestions).toEqual([resumeText(NOTES, WORDS.ru)])
+  const ui = await $.ui.mount({ plugin: 'context-bar-compact', surface: 'terminal', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /^↩ handoff только что: моды$/ })).toBeDefined()
+  await ui.unmount()
+  expect((await run('lang de')).text).toMatch(/^Как вызвать:/)
+})
+
+test('the details pane is read again while the engine lists it open, not by a flag a /clear leaves behind', async ($, on) => {
+  let panes: { id: string; title: string; isShown: boolean; isFocused: boolean; isPlaced: boolean }[] = []
+  let fullReads = 0
+  mock.clock(on)
+  on('session.usage', ($, e) => {
+    if (e.breakdown === 'full') fullReads++
+    return { value: USAGE }
+  })
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  on('ui.panes', () => ({ value: panes }))
+  on('ui.open', ($, e) => {
+    panes = [{ id: e.id, title: e.title ?? e.id, isShown: true, isFocused: false, isPlaced: true }]
+    return { value: { isPlaced: true } }
+  })
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const turnEnd = () => $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+
+  await $.command.run({ command: 'context-bar', args: 'details', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(fullReads).toBe(1)
+  // After a /clear the pane is still up: it is counted afresh, and again after each turn.
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as Parameters<typeof $.session.end>[0])
+  expect(fullReads).toBeGreaterThan(1)
+  const afterClear = fullReads
+  await turnEnd()
+  expect(fullReads).toBe(afterClear + 1)
+  // Closed, whatever any hook made of the close: no more full reads.
+  panes = []
+  await turnEnd()
+  expect(fullReads).toBe(afterClear + 1)
+})
+
+test('a narrow band gives way a step at a time: the turns left, then the room before compaction, then the limits', () => {
+  const snap = {
+    segments: [],
+    total: 60_000,
+    max: 200_000,
+    percent: 30,
+    startedAt: 0,
+    limits: [
+      { kind: 'five_hour', percentUsed: 42, resetsAt: 2 * HOUR + 14 * 60_000 },
+      { kind: 'seven_day', percentUsed: 18 },
+    ],
+    compactIn: 100_000,
+  }
+  const lineAt = (columns: number) => {
+    const l = layoutOf(snap, 10, 0, columns, WORDS.en)
+    const right = l.limits.map(p => `${p.label} ${p.percent}%${p.reset}`).join(' · ')
+    return { context: l.context, right, width: l.width, length: l.width + 4 + l.context.length + (right ? 3 + right.length : 0) }
+  }
+  expect(lineAt(160)).toMatchObject({ context: ' 60k/200k · compacts in 100k (~10 turns)', right: '5-hour 42% resets in 2h14m · weekly 18%', width: 20 })
+  expect(lineAt(100)).toMatchObject({ context: ' 60k/200k · compacts in 100k (~10 turns)', right: '5h 42% ↻2h14m · 7d 18%' })
+  expect(lineAt(70)).toMatchObject({ context: ' 60k/200k · compacts in 100k', right: '5h 42% ↻2h14m · 7d 18%' })
+  expect(lineAt(60)).toMatchObject({ context: ' 60k/200k', right: '5h 42% ↻2h14m · 7d 18%' })
+  expect(lineAt(40)).toMatchObject({ context: ' 60k/200k', right: '', width: 20 })
+  // Whatever fits is drawn whole: the line never runs past the band while a step is left.
+  for (const columns of [160, 100, 80, 70, 60, 50, 40, 30]) expect(lineAt(columns).length).toBeLessThanOrEqual(columns)
+  // Narrower still, the bar keeps its least and the line is cut at its end.
+  expect(lineAt(15)).toMatchObject({ context: ' 60k/200k', right: '', width: 8 })
+})
+
+test('at 60 and 40 columns the band drops what does not fit rather than clip it', async ($, on) => {
+  mock.clock(on, { now: 1_000 + 2 * HOUR })
+  on('session.usage', () => ({ value: RICH }))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  on('command.register', () => ({ value: { command: 'context-bar' } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: 'C:\\', surface: 'terminal', isInteractive: true })
+  const at = (bodyColumns: number) => ({ ...BAND, props: { ...BAND.props, bodyColumns } })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    let ui = await $.ui.mount({ plugin: 'context-bar-compact', surface, ...at(60) })
+    expect(await ui.find({ type: 'Text', text: /▒ 30% 60k\/200k$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /compacts in/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /^5h 42% ↻2h14m · 7d 18%$/ })).toBeDefined()
+    await ui.unmount()
+
+    ui = await $.ui.mount({ plugin: 'context-bar-compact', surface, ...at(40) })
+    expect(await ui.find({ type: 'Text', text: /▒ 30% 60k\/200k$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /5h|7d/ })).toBeUndefined()
+    await ui.unmount()
+  }
 })
 
 test('the pace: turns left once two turns are counted, started over by a compact', () => {

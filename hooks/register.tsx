@@ -9,7 +9,6 @@ const snapshot = { plugin: 'context-bar-compact', key: 'snapshot' } as const
 // The time the band last read, bumped each minute so the reset countdowns move.
 const now = { plugin: 'context-bar-compact', key: 'now' } as const
 const details = { plugin: 'context-bar-compact', key: 'details' } as const
-const isDetailsOpen = { plugin: 'context-bar-compact', key: 'isDetailsOpen' } as const
 // The working zone in force: what /context-bar zone saved, else the defaults.
 const zoneState = { plugin: 'context-bar-compact', key: 'zone' } as const
 // The handoff offered above the prompt, until it is taken up, dismissed or another prompt is sent.
@@ -41,6 +40,8 @@ export const PRESETS: readonly Thresholds[] = [
 ]
 const GLYPH = { used: '█', buffer: '▒', free: '░' } as const
 const BAR_CELLS = 20
+// The narrowest the bar gets before the figures beside it give way.
+const BAR_MIN_CELLS = 8
 const REFRESH_MS = 3000
 const TICK_MS = 60_000
 const LIMIT_WARN_AT = 75
@@ -284,6 +285,32 @@ export const limitParts = (limits: readonly Limit[], at: number, isShort: boolea
 
 export const limitsText = (parts: readonly LimitPart[]) => parts.map(p => `${p.label} ${p.percent}%${p.reset}`).join(' · ')
 
+export type Layout = { context: string; limits: LimitPart[]; width: number }
+// The widest line that fits in `columns`: the long labels beside a full bar, else the short labels
+// and a bar narrowed to the room left; then, a step at a time, without the turns left, without
+// the room before compaction, without the limits. Past that the line is cut at its end.
+export const layoutOf = (snap: Snapshot, turns: number | undefined, at: number, columns: number, w: Words = EN): Layout => {
+  const bare: Snapshot = { ...snap }
+  delete bare.compactIn
+  const steps = [
+    { isShort: false, context: contextLine(snap, turns, w), hasLimits: true, least: BAR_CELLS },
+    { isShort: true, context: contextLine(snap, turns, w), hasLimits: true, least: BAR_MIN_CELLS },
+    { isShort: true, context: contextLine(snap, undefined, w), hasLimits: true, least: BAR_MIN_CELLS },
+    { isShort: true, context: contextLine(bare, undefined, w), hasLimits: true, least: BAR_MIN_CELLS },
+    { isShort: true, context: contextLine(bare, undefined, w), hasLimits: false, least: BAR_MIN_CELLS },
+  ]
+  const figure = ` ${snap.percent}%`.length
+  let layout: Layout = { context: '', limits: [], width: BAR_MIN_CELLS }
+  for (const step of steps) {
+    const limits = step.hasLimits ? limitParts(snap.limits, at, step.isShort, w) : []
+    const right = limitsText(limits).length
+    const room = columns - figure - step.context.length - (right > 0 ? GAP + right : 0)
+    layout = { context: step.context, limits, width: Math.max(BAR_MIN_CELLS, Math.min(BAR_CELLS, room)) }
+    if (room >= step.least) break
+  }
+  return layout
+}
+
 // A rate limit reads green while there is room, yellow as it runs short, red near the end.
 export const limitColor = (percent: number) => (percent >= LIMIT_ALERT_AT ? 'error' : percent >= LIMIT_WARN_AT ? 'warning' : 'success')
 
@@ -319,6 +346,18 @@ const tail = (path: string) => {
 
 const byTokens = (a: Row, b: Row) => b.tokens - a.tokens
 
+// A path read on any machine: either separator, and a Windows path (a drive letter or a backslash)
+// in one case, as its file system ignores case.
+const isWindowsPath = (path: string) => /^[A-Za-z]:/.test(path) || path.includes('\\')
+const slashed = (text: string, isWindows: boolean) => {
+  const one = text.replace(/[\\/]+/g, '/')
+  return isWindows ? one.toLowerCase() : one
+}
+// The one spelling of a folder or file, for keys and comparisons.
+export const pathKey = (path: string) => slashed(path, isWindowsPath(path)).replace(/(?<=.)\/$/, '')
+// Whether a prompt names `path`, however its slashes or, on Windows, its letters were typed.
+export const mentionsPath = (text: string, path: string) => slashed(text, isWindowsPath(path)).includes(pathKey(path))
+
 // The handoff skill names its file freely; a Markdown file written while it runs, or one in a
 // temporary directory with `handoff` in its name, is taken for one.
 export const isHandoffFile = (path: string, isRunning: boolean) =>
@@ -333,11 +372,26 @@ export const handoffTitle = (content: string, path: string) => {
 
 export const resumeText = (path: string, w: Words = EN) => w.resumeText(path)
 
-// The language and zone in force, kept by the module too: a /clear empties $.state and the module
-// lives on, so a read falls back here until the values are set again.
-const kept: { lang: Lang; zone: Thresholds } = { lang: 'en', zone: DEFAULT_THRESHOLDS }
+// The language, zone and handoff offer in force, kept by the module too: a /clear empties $.state
+// and the module lives on, so a read falls back here until the values are set again.
+const kept: { lang: Lang; zone: Thresholds; offer: Handoff | null } = { lang: 'en', zone: DEFAULT_THRESHOLDS, offer: null }
 
 const wordsIn = async ($: EngineInterface) => WORDS[(await $.state.get(langState)).value ?? kept.lang]
+
+// The handoff on offer; never written in this conversation's $.state, what the module offered.
+const offered = async ($: EngineInterface) => {
+  const { value } = await $.state.get(offer)
+  return value === undefined ? kept.offer : value
+}
+
+const setOffer = async ($: EngineInterface, next: Handoff | null) => {
+  kept.offer = next
+  await $.state.set(offer, next)
+}
+
+// The engine's record of the details pane rather than a flag of the module's, which a /clear (the
+// pane still up) or a failed ui.close hook would leave wrong.
+const isDetailsUp = async ($: EngineInterface) => ((await $.ui.panes().catch(() => undefined)) ?? []).some(p => p.id === PANE)
 
 let lastFetch = 0
 let isFetching = false
@@ -443,7 +497,6 @@ async function afterTurn($: EngineInterface, hasReplied: boolean) {
 }
 
 async function openDetails($: EngineInterface) {
-  await $.state.set(isDetailsOpen, true)
   await $.ui.open({ id: PANE, title: (await wordsIn($)).detailsTitle })
   await refreshDetails($).catch(() => {})
 }
@@ -464,10 +517,10 @@ const savedHandoffs = async ($: EngineInterface) =>
 // What a fresh start in this folder is offered: its latest handoff, if recent and still on disk.
 // The prompt box shows the request to read it as its dim suggestion, Tab to take.
 async function offerHandoff($: EngineInterface, cwd: string) {
-  const saved = (await savedHandoffs($))[cwd]
+  const saved = (await savedHandoffs($))[pathKey(cwd)]
   const at = await $.clock.now()
   const isLive = saved !== undefined && at - saved.at < HANDOFF_MAX_AGE_MS && (await $.fs.exists(saved.path).catch(() => false))
-  await $.state.set(offer, isLive ? saved : null)
+  await setOffer($, isLive ? saved : null)
   if (isLive) {
     const text = resumeText(saved.path, await wordsIn($))
     void $.clock.sleep(300).then(() => $.prompt.suggest({ text })).catch(() => {})
@@ -476,15 +529,16 @@ async function offerHandoff($: EngineInterface, cwd: string) {
 
 async function forgetHandoff($: EngineInterface, spent: Handoff) {
   const all = await savedHandoffs($)
-  if (all[spent.cwd]?.path === spent.path) {
-    delete all[spent.cwd]
+  const key = pathKey(spent.cwd)
+  if (all[key] !== undefined && pathKey(all[key].path) === pathKey(spent.path)) {
+    delete all[key]
     await $.store.set(HANDOFFS_KEY, all)
   }
-  await $.state.set(offer, null)
+  await setOffer($, null)
 }
 
 // What the session starts from, read again from the store: the language and the zone. Run at the
-// start and after a /clear, which empties $.state and fires no session.start.
+// start and after a /clear or /resume, which empty $.state and fire no session.start.
 async function restore($: EngineInterface) {
   const lang = await $.store.get(LANG_KEY).catch(() => undefined)
   kept.lang = lang === 'ru' ? 'ru' : 'en'
@@ -492,6 +546,21 @@ async function restore($: EngineInterface) {
   const saved = (await $.store.get(ZONE_KEY).catch(() => undefined)) as Partial<Thresholds> | undefined
   kept.zone = saved ? thresholdsOf(saved.warnAt, saved.alertAt) : DEFAULT_THRESHOLDS
   await $.state.set(zoneState, kept.zone)
+}
+
+// The next conversation of the same process, after a /clear or a /resume: what it starts from read
+// again, the pace and the cache's clock started over after a /clear, and the bar and an open details
+// pane drawn afresh. Safe to run twice for one change.
+async function startOver($: EngineInterface, isClear: boolean) {
+  await restore($)
+  await $.state.set(hasStarted, true)
+  if (isClear) {
+    // A new conversation: no pace yet, and no cache of its own to lose.
+    await $.state.set(paceState, null)
+    await $.state.set(repliedAt, 0)
+  }
+  await refresh($, true).catch(() => {})
+  if (await isDetailsUp($)) void refreshDetails($).catch(() => {})
 }
 
 export const register: Register = on => {
@@ -520,32 +589,35 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A /clear (a /resume, a compaction) starts no session.start, and a /clear or /resume empties
-  // $.state: what the session started from is read again, and after a /clear the conversation
-  // that follows is offered the handoff just written.
+  // A /clear or a /resume starts no session.start: it ends the session, and that end is where the
+  // next conversation is set up, everywhere, an organization's managed install included. After a
+  // /clear it is offered the handoff just written.
+  on('session.end', async ($, e, next) => {
+    const ran = await next(e)
+    if (e.reason !== 'clear' && e.reason !== 'resume') return ran
+    await startOver($, e.reason === 'clear')
+    const root = e.reason === 'clear' ? await $.session.root().catch(() => undefined) : undefined
+    if (root !== undefined) await offerHandoff($, root).catch(() => {})
+    return ran
+  }).catch(($, e, next) => next(e))
+
+  // The same again once the next conversation has begun (a compaction too), where settings hooks
+  // run, not under an organization's management: should $.state be emptied after session.end, the
+  // values are set in the conversation that reads them. The offer stays session.end's, kept by the
+  // module. Without it the bar reads a compaction at the next session.measure or turn.
   on('classic.SessionStart', async ($, e, next) => {
     const ran = await next(e)
-    if (e.source === 'startup') return ran
-    await restore($)
-    await $.state.set(hasStarted, true)
-    if (e.source === 'clear') {
-      // A new conversation: no pace yet, and no cache of its own to lose.
-      await $.state.set(paceState, null)
-      await $.state.set(repliedAt, 0)
-      const root = await $.session.root().catch(() => undefined)
-      if (root !== undefined) await offerHandoff($, root).catch(() => {})
-    }
-    await refresh($, true).catch(() => {})
+    if (e.source !== 'startup') await startOver($, e.source === 'clear')
     return ran
   }).catch(($, e, next) => next(e))
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command && /(^|:)handoff$/.test(e.command.name)) isHandingOff = true
-    const waiting = (await $.state.get(offer)).value ?? null
+    const waiting = await offered($)
     // Taken up, it is spent; any other prompt only puts it away for this conversation.
     if (waiting && !e.isMeta) {
-      if (e.text.includes(waiting.path)) await forgetHandoff($, waiting)
-      else await $.state.set(offer, null)
+      if (mentionsPath(e.text, waiting.path)) await forgetHandoff($, waiting)
+      else await setOffer($, null)
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -555,9 +627,10 @@ export const register: Register = on => {
     if (ran.deny === undefined && !ran.isError && isHandoffFile(e.file_path, isHandingOff)) {
       // The project root, not the shell's directory: a `cd` during the session would file the
       // handoff under a folder the next session never starts in.
+      // Filed under one spelling of it, so `D:\proj` and `d:/proj` are the same folder.
       const cwd = await $.session.root()
       const written: Handoff = { path: e.file_path, cwd, at: await $.clock.now(), title: handoffTitle(e.content, e.file_path) }
-      await $.store.set(HANDOFFS_KEY, { ...(await savedHandoffs($)), [cwd]: written })
+      await $.store.set(HANDOFFS_KEY, { ...(await savedHandoffs($)), [pathKey(cwd)]: written })
     }
     return ran
   }).catch(($, e, next) => next(e))
@@ -586,18 +659,13 @@ export const register: Register = on => {
       await $.state.set(langState, asked)
       await $.store.set(LANG_KEY, asked)
       // The breakdown's notes are worded when read: read it again in the new language.
-      if ((await $.state.get(isDetailsOpen)).value ?? false) void refreshDetails($).catch(() => {})
+      if (await isDetailsUp($)) void refreshDetails($).catch(() => {})
       return { text: WORDS[asked].langSet }
     }
     const nextOn = !((await $.state.get(isOn)).value ?? true)
     await $.state.set(isOn, nextOn)
     if (nextOn) await refresh($, true)
     return { text: nextOn ? w.barOn : w.barOff }
-  })
-
-  on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) await $.state.set(isDetailsOpen, false)
-    return next(e)
   })
 
   on('session.measure', ($, e, next) => {
@@ -610,13 +678,13 @@ export const register: Register = on => {
     if (e.agentId !== undefined) return next(e)
     isHandingOff = false
     void afterTurn($, e.usage !== undefined).catch(() => {})
-    if ((await $.state.get(isDetailsOpen)).value ?? false) void refreshDetails($).catch(() => {})
+    if (await isDetailsUp($)) void refreshDetails($).catch(() => {})
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const waiting = (await $.state.get(offer)).value ?? null
+    const waiting = await offered($)
     const snap = ((await $.state.get(isOn)).value ?? true) ? ((await $.state.get(snapshot)).value ?? null) : null
     const hasBar = snap !== null && snap.segments.length > 0
     if (!hasBar && !waiting) return next(e)
@@ -652,17 +720,10 @@ export const register: Register = on => {
     const zone = zoneOf(snap.percent, thresholds)
     const figure = ` ${snap.percent}%`
     const pace = (await $.state.get(paceState)).value ?? null
-    const context = contextLine(snap, snap.compactIn !== undefined ? turnsLeft(snap.compactIn, pace) : undefined, w)
-    // The widest layout that fits: the long labels beside a full bar, else the short labels and
-    // a bar narrowed to the room left; past that the line is cut at its end.
-    const roomFor = (isShort: boolean) => {
-      const right = limitsText(limitParts(snap.limits, at, isShort, w)).length
-      return e.props.bodyColumns - figure.length - context.length - (right > 0 ? GAP + right : 0)
-    }
-    const isShort = roomFor(false) < BAR_CELLS
-    const width = isShort ? Math.max(8, Math.min(BAR_CELLS, roomFor(true))) : BAR_CELLS
+    const turns = snap.compactIn !== undefined ? turnsLeft(snap.compactIn, pace) : undefined
+    // The widest layout that fits the band, so the two sides never meet whatever the terminal.
+    const { context, limits, width } = layoutOf(snap, turns, at, e.props.bodyColumns, w)
     const cells = allocate(snap.segments, snap.max, width)
-    const limits = limitParts(snap.limits, at, isShort, w)
     const left = (
       <Text wrap="truncate">
         {snap.segments.map((s, i) =>

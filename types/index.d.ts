@@ -40,6 +40,6 @@ export type Lang = 'en' | 'ru'
 
 declare module 'claude-code' {
   interface PluginState {
-    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; isDetailsOpen: boolean; zone: Thresholds; handoff: Handoff | null; hasStarted: boolean; pace: Pace | null; repliedAt: number; lang: Lang }
+    'context-bar-compact': { isOn: boolean; snapshot: Snapshot | null; now: number; details: Details | null; zone: Thresholds; handoff: Handoff | null; hasStarted: boolean; pace: Pace | null; repliedAt: number; lang: Lang }
   }
 }
